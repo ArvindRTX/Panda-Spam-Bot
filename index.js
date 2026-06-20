@@ -9,8 +9,56 @@ import {
 } from 'discord.js';
 import 'dotenv/config';
 import express from 'express';
+import pg from 'pg';
 
+const { Pool } = pg;
 const token = process.env.DISCORD_TOKEN;
+const databaseUrl = process.env.DATABASE_URL;
+const ownerId = process.env.OWNER_ID;
+
+const authorizedUsers = process.env.AUTHORIZED_USERS
+  ? process.env.AUTHORIZED_USERS.split(',').map(id => id.trim())
+  : [];
+
+const pool = new Pool({
+  connectionString: databaseUrl,
+  ssl: databaseUrl ? { rejectUnauthorized: false } : false
+});
+
+async function initDb() {
+  if (!databaseUrl) {
+    console.warn('[Database] WARNING: DATABASE_URL is not set. The bot will run without database integration.');
+    return;
+  }
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS authorized_users (
+        user_id VARCHAR(30) PRIMARY KEY,
+        added_by VARCHAR(30),
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    console.log('[Database] PostgreSQL table initialized successfully.');
+  } catch (error) {
+    console.error('[Database] Failed to initialize database:', error.message);
+  }
+}
+
+async function isUserAuthorized(userId) {
+  if (ownerId && userId === ownerId) {
+    return true;
+  }
+  if (!databaseUrl) {
+    return authorizedUsers.includes(userId);
+  }
+  try {
+    const res = await pool.query('SELECT 1 FROM authorized_users WHERE user_id = $1', [userId]);
+    return res.rowCount > 0;
+  } catch (error) {
+    console.error('[Database] Error checking authorization:', error.message);
+    return authorizedUsers.includes(userId);
+  }
+}
 
 if (!token || token === 'your_bot_token_here') {
   console.error('Error: Please populate your DISCORD_TOKEN in the .env file before starting the bot.');
@@ -34,8 +82,45 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
-// Track active spam sessions and sent messages per user
+// Track active spam queues and sent messages per user
 const userSpams = new Map();
+
+// Helper to process a user's spam queue sequentially
+async function processQueue(userId) {
+  const userData = userSpams.get(userId);
+  if (!userData || userData.sending || userData.queue.length === 0) {
+    return;
+  }
+
+  userData.sending = true;
+
+  try {
+    while (userData.queue.length > 0) {
+      const item = userData.queue.shift();
+
+      try {
+        const msg = await item.interaction.followUp({
+          content: item.messageText
+        });
+        userData.messages.push({
+          id: msg.id,
+          channelId: msg.channelId,
+          webhook: item.interaction.webhook
+        });
+        console.log(`[Spam] Sent message ${msg.id} for user ${userId}`);
+      } catch (loopError) {
+        console.error(`[Spam Queue Error] Failed to send follow-up message for user ${userId}:`, loopError.message);
+      }
+
+      // Add a small delay between messages to preserve order and avoid rate limits
+      if (userData.queue.length > 0) {
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+    }
+  } finally {
+    userData.sending = false;
+  }
+}
 
 // Global REST rate limit listener to help monitor rate limits without crashing
 client.rest.on('rateLimited', (info) => {
@@ -45,6 +130,9 @@ client.rest.on('rateLimited', (info) => {
 client.once(Events.ClientReady, async () => {
   console.log(`Successfully logged in as ${client.user.tag}!`);
   console.log('Bot is ready to handle user-installable interactions.');
+
+  // Initialize database
+  await initDb();
 
   try {
     console.log('Attempting to update profile picture using cute-dancing-panda.gif...');
@@ -57,6 +145,20 @@ client.once(Events.ClientReady, async () => {
 
 // Handle interactions
 client.on('interactionCreate', async (interaction) => {
+  // Check authorization dynamically (checking owner, database, or fallback array)
+  const isAuthorized = await isUserAuthorized(interaction.user.id);
+  if (!isAuthorized) {
+    try {
+      await interaction.reply({
+        content: '❌ You are not authorized to use this application.',
+        flags: MessageFlags.Ephemeral
+      });
+    } catch (err) {
+      console.error('Failed to reply to unauthorized user:', err.message);
+    }
+    return;
+  }
+
   // 1. Handle Slash Commands
   if (interaction.isChatInputCommand()) {
     const { commandName } = interaction;
@@ -108,11 +210,8 @@ client.on('interactionCreate', async (interaction) => {
         const userId = interaction.user.id;
         const userData = userSpams.get(userId);
 
-        if (userData && userData.activeSessions.size > 0) {
-          for (const session of userData.activeSessions) {
-            session.active = false;
-          }
-          userData.activeSessions.clear();
+        if (userData && (userData.queue.length > 0 || userData.sending)) {
+          userData.queue = []; // Clear the queue to stop further sends immediately
           await interaction.reply({
             content: '🛑 Stopped all your active spam sequences.',
             flags: MessageFlags.Ephemeral
@@ -133,12 +232,13 @@ client.on('interactionCreate', async (interaction) => {
         const userId = interaction.user.id;
         const userData = userSpams.get(userId);
 
-        // First stop any active sessions for this user
-        if (userData && userData.activeSessions.size > 0) {
-          for (const session of userData.activeSessions) {
-            session.active = false;
+        // First stop any active queue for this user
+        if (userData) {
+          userData.queue = [];
+          // Wait for the active in-flight message to finish if sending is true
+          while (userData.sending) {
+            await new Promise(resolve => setTimeout(resolve, 50));
           }
-          userData.activeSessions.clear();
         }
 
         if (userData && userData.messages.length > 0) {
@@ -151,15 +251,29 @@ client.on('interactionCreate', async (interaction) => {
             flags: MessageFlags.Ephemeral
           });
 
-          let deletedCount = 0;
-          for (const msg of messagesToDelete) {
+          const deletePromises = messagesToDelete.map(async (item) => {
             try {
-              await msg.delete();
-              deletedCount++;
-            } catch (deleteError) {
-              console.error('Failed to delete message:', deleteError.message);
+              console.log(`[Unsend] Deleting message: ${item.id}`);
+              // Try webhook deletion first (fast, works in user-installed non-member guild channels)
+              await item.webhook.deleteMessage(item.id);
+              return true;
+            } catch (webhookError) {
+              console.warn(`[Unsend Webhook Warning] Webhook deletion failed for message ${item.id}: ${webhookError.message}. Falling back to API channel fetch...`);
+              try {
+                // Fallback to fetching channel and message via bot token
+                const channel = await client.channels.fetch(item.channelId);
+                const fetchedMsg = await channel.messages.fetch(item.id);
+                await fetchedMsg.delete();
+                return true;
+              } catch (deleteError) {
+                console.error(`[Unsend Error] Failed to delete message ${item.id}:`, deleteError.message);
+                return false;
+              }
             }
-          }
+          });
+
+          const results = await Promise.all(deletePromises);
+          const deletedCount = results.filter(Boolean).length;
 
           await interaction.followUp({
             content: `✨ Successfully deleted ${deletedCount} messages and cleared all traces.`,
@@ -173,6 +287,102 @@ client.on('interactionCreate', async (interaction) => {
         }
       } catch (error) {
         console.error('Error executing /unsend command:', error);
+      }
+    }
+
+    else if (commandName === 'authorize') {
+      try {
+        const targetUser = interaction.options.getUser('user');
+        const executorId = interaction.user.id;
+
+        // Strictly check that ONLY the owner can authorize users
+        if (!ownerId || executorId !== ownerId) {
+          return interaction.reply({
+            content: '❌ Only the application owner can authorize new users.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        if (!databaseUrl) {
+          return interaction.reply({
+            content: '❌ Database is not configured. Cannot authorize users dynamically.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        // Check if the user is already authorized
+        const checkRes = await pool.query('SELECT 1 FROM authorized_users WHERE user_id = $1', [targetUser.id]);
+        if (checkRes.rowCount > 0 || (ownerId && targetUser.id === ownerId)) {
+          return interaction.reply({
+            content: `ℹ️ User ${targetUser.username} (${targetUser.id}) is already authorized.`,
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        await pool.query(
+          'INSERT INTO authorized_users (user_id, added_by) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING',
+          [targetUser.id, executorId]
+        );
+
+        await interaction.reply({
+          content: `✅ Successfully authorized ${targetUser.username} (${targetUser.id}).`,
+          flags: MessageFlags.Ephemeral
+        });
+      } catch (error) {
+        console.error('Error executing /authorize command:', error);
+        await interaction.reply({
+          content: '❌ Database error occurred while authorizing user.',
+          flags: MessageFlags.Ephemeral
+        }).catch(() => {});
+      }
+    }
+
+    else if (commandName === 'deauthorize') {
+      try {
+        const targetUser = interaction.options.getUser('user');
+        const executorId = interaction.user.id;
+
+        // Strictly check that ONLY the owner can deauthorize users
+        if (!ownerId || executorId !== ownerId) {
+          return interaction.reply({
+            content: '❌ Only the application owner can deauthorize users.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        if (targetUser.id === ownerId) {
+          return interaction.reply({
+            content: '❌ You cannot deauthorize the application owner.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        if (!databaseUrl) {
+          return interaction.reply({
+            content: '❌ Database is not configured. Cannot deauthorize users dynamically.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        const res = await pool.query('DELETE FROM authorized_users WHERE user_id = $1', [targetUser.id]);
+
+        if (res.rowCount > 0) {
+          await interaction.reply({
+            content: `✅ Successfully removed authorization for ${targetUser.username} (${targetUser.id}).`,
+            flags: MessageFlags.Ephemeral
+          });
+        } else {
+          await interaction.reply({
+            content: `❓ User ${targetUser.username} (${targetUser.id}) was not authorized.`,
+            flags: MessageFlags.Ephemeral
+          });
+        }
+      } catch (error) {
+        console.error('Error executing /deauthorize command:', error);
+        await interaction.reply({
+          content: '❌ Database error occurred while deauthorizing user.',
+          flags: MessageFlags.Ephemeral
+        }).catch(() => {});
       }
     }
   }
@@ -200,41 +410,23 @@ client.on('interactionCreate', async (interaction) => {
 
         // Initialize user entry if not exists
         if (!userSpams.has(userId)) {
-          userSpams.set(userId, { activeSessions: new Set(), messages: [] });
+          userSpams.set(userId, { queue: [], sending: false, messages: [] });
         }
         const userData = userSpams.get(userId);
 
-        // Start a new session
-        const session = { active: true };
-        userData.activeSessions.add(session);
+        // Acknowledge the interaction immediately to prevent timeout silently
+        await interaction.deferUpdate();
 
-        // Acknowledge the interaction immediately to prevent timeout (ephemeral)
-        await interaction.reply({
-          content: 'Spam sequence initiated...'
-        });
-
-        // Loop to send exactly 5 separate follow-up messages
-        for (let i = 1; i <= 5; i++) {
-          if (!session.active) {
-            break;
-          }
-
-          try {
-            const msg = await interaction.followUp({
-              content: messageText
-            });
-            userData.messages.push(msg);
-
-            // Sleep 250ms between calls to speed up the spam sequence while keeping it safe
-            await new Promise(resolve => setTimeout(resolve, 250));
-          } catch (loopError) {
-            console.error(`[Spam Loop Error] Failed to send follow-up ${i}/5:`, loopError.message);
-            // Pause longer if we hit a rate limit, then continue. Bot won't crash.
-            await new Promise(resolve => setTimeout(resolve, 2500));
-          }
+        // Add 5 messages to the queue
+        for (let i = 0; i < 5; i++) {
+          userData.queue.push({
+            messageText,
+            interaction
+          });
         }
 
-        userData.activeSessions.delete(session);
+        // Start processing the queue (it will self-gate if already sending)
+        processQueue(userId);
       } catch (error) {
         console.error('Error handling spam_click button:', error);
       }

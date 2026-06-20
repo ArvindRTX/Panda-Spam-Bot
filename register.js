@@ -54,6 +54,34 @@ const commands = [
     description: 'Deletes all spam messages sent by the bot for you',
     integration_types: [1],
     contexts: [0, 1, 2]
+  },
+  {
+    name: 'authorize',
+    description: 'Authorizes a user to use this application (Owner Only)',
+    integration_types: [1],
+    contexts: [0, 1, 2],
+    options: [
+      {
+        name: 'user',
+        description: 'The user to authorize',
+        type: 6, // USER type
+        required: true
+      }
+    ]
+  },
+  {
+    name: 'deauthorize',
+    description: 'Removes authorization for a user (Owner Only)',
+    integration_types: [1],
+    contexts: [0, 1, 2],
+    options: [
+      {
+        name: 'user',
+        description: 'The user to deauthorize',
+        type: 6, // USER type
+        required: true
+      }
+    ]
   }
 ];
 
