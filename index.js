@@ -34,6 +34,9 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
+// Track active spam sessions and sent messages per user
+const userSpams = new Map();
+
 // Global REST rate limit listener to help monitor rate limits without crashing
 client.rest.on('rateLimited', (info) => {
   console.warn(`[REST Rate Limit] Path: ${info.path} | Limit: ${info.limit} | TimeToReset: ${info.timeToReset}ms | Global: ${info.global}`);
@@ -99,6 +102,79 @@ client.on('interactionCreate', async (interaction) => {
         console.error('Error executing /spam command:', error);
       }
     }
+
+    else if (commandName === 'stop') {
+      try {
+        const userId = interaction.user.id;
+        const userData = userSpams.get(userId);
+
+        if (userData && userData.activeSessions.size > 0) {
+          for (const session of userData.activeSessions) {
+            session.active = false;
+          }
+          userData.activeSessions.clear();
+          await interaction.reply({
+            content: '🛑 Stopped all your active spam sequences.',
+            flags: MessageFlags.Ephemeral
+          });
+        } else {
+          await interaction.reply({
+            content: 'You do not have any active spam sequence running.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+      } catch (error) {
+        console.error('Error executing /stop command:', error);
+      }
+    }
+
+    else if (commandName === 'unsend') {
+      try {
+        const userId = interaction.user.id;
+        const userData = userSpams.get(userId);
+
+        // First stop any active sessions for this user
+        if (userData && userData.activeSessions.size > 0) {
+          for (const session of userData.activeSessions) {
+            session.active = false;
+          }
+          userData.activeSessions.clear();
+        }
+
+        if (userData && userData.messages.length > 0) {
+          // Deleting messages
+          const messagesToDelete = [...userData.messages];
+          userData.messages = []; // Clear local list immediately to prevent double-deletes
+
+          await interaction.reply({
+            content: '🧹 Deleting spam messages to clean traces...',
+            flags: MessageFlags.Ephemeral
+          });
+
+          let deletedCount = 0;
+          for (const msg of messagesToDelete) {
+            try {
+              await msg.delete();
+              deletedCount++;
+            } catch (deleteError) {
+              console.error('Failed to delete message:', deleteError.message);
+            }
+          }
+
+          await interaction.followUp({
+            content: `✨ Successfully deleted ${deletedCount} messages and cleared all traces.`,
+            flags: MessageFlags.Ephemeral
+          });
+        } else {
+          await interaction.reply({
+            content: 'No spam messages found to delete.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+      } catch (error) {
+        console.error('Error executing /unsend command:', error);
+      }
+    }
   }
 
   // 2. Handle Button Component Interactions
@@ -120,6 +196,18 @@ client.on('interactionCreate', async (interaction) => {
     else if (customId.startsWith('spam_click:')) {
       try {
         const messageText = customId.slice('spam_click:'.length);
+        const userId = interaction.user.id;
+
+        // Initialize user entry if not exists
+        if (!userSpams.has(userId)) {
+          userSpams.set(userId, { activeSessions: new Set(), messages: [] });
+        }
+        const userData = userSpams.get(userId);
+
+        // Start a new session
+        const session = { active: true };
+        userData.activeSessions.add(session);
+
         // Acknowledge the interaction immediately to prevent timeout (ephemeral)
         await interaction.reply({
           content: 'Spam sequence initiated...'
@@ -127,10 +215,15 @@ client.on('interactionCreate', async (interaction) => {
 
         // Loop to send exactly 5 separate follow-up messages
         for (let i = 1; i <= 5; i++) {
+          if (!session.active) {
+            break;
+          }
+
           try {
-            await interaction.followUp({
+            const msg = await interaction.followUp({
               content: messageText
             });
+            userData.messages.push(msg);
 
             // Sleep 250ms between calls to speed up the spam sequence while keeping it safe
             await new Promise(resolve => setTimeout(resolve, 250));
@@ -140,6 +233,8 @@ client.on('interactionCreate', async (interaction) => {
             await new Promise(resolve => setTimeout(resolve, 2500));
           }
         }
+
+        userData.activeSessions.delete(session);
       } catch (error) {
         console.error('Error handling spam_click button:', error);
       }

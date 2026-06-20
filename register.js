@@ -42,6 +42,18 @@ const commands = [
         max_length: 80
       }
     ]
+  },
+  {
+    name: 'stop',
+    description: 'Stops all your currently running spam sequences',
+    integration_types: [1],
+    contexts: [0, 1, 2]
+  },
+  {
+    name: 'unsend',
+    description: 'Deletes all spam messages sent by the bot for you',
+    integration_types: [1],
+    contexts: [0, 1, 2]
   }
 ];
 
