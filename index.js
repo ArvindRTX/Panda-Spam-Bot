@@ -110,8 +110,7 @@ client.on('interactionCreate', async (interaction) => {
         const messageText = customId.slice('ping_click:'.length);
         // Triggered when "Click Me" button is clicked: replies with the custom message
         await interaction.reply({
-          content: messageText,
-          flags: MessageFlags.Ephemeral
+          content: messageText
         });
       } catch (error) {
         console.error('Error handling ping_click button:', error);
@@ -123,16 +122,14 @@ client.on('interactionCreate', async (interaction) => {
         const messageText = customId.slice('spam_click:'.length);
         // Acknowledge the interaction immediately to prevent timeout (ephemeral)
         await interaction.reply({
-          content: 'Spam sequence initiated...',
-          flags: MessageFlags.Ephemeral
+          content: 'Spam sequence initiated...'
         });
 
         // Loop to send exactly 5 separate follow-up messages
         for (let i = 1; i <= 5; i++) {
           try {
             await interaction.followUp({
-              content: messageText,
-              flags: MessageFlags.Ephemeral
+              content: messageText
             });
 
             // Sleep 250ms between calls to speed up the spam sequence while keeping it safe
