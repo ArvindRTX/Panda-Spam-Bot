@@ -150,7 +150,7 @@ client.on('interactionCreate', async (interaction) => {
   if (!isAuthorized) {
     try {
       await interaction.reply({
-        content: '❌ You are not authorized to use this application.',
+        content: `❌ You are Not Authorized to Use this App , DM Panda AWM <@${ownerId || '1322563623087767677'}> for access`,
         flags: MessageFlags.Ephemeral
       });
     } catch (err) {
