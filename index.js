@@ -19,6 +19,7 @@ import pg from 'pg';
 
 const { Pool } = pg;
 const token = process.env.DISCORD_TOKEN;
+const clientId = process.env.CLIENT_ID;
 const databaseUrl = process.env.DATABASE_URL;
 const ownerId = process.env.OWNER_ID;
 const clientSecret = process.env.CLIENT_SECRET;
@@ -577,8 +578,8 @@ app.get('/api/events', (req, res) => {
     'Connection': 'keep-alive'
   });
 
-  const clientId = Date.now();
-  const newClient = { id: clientId, res };
+  const sseClientId = Date.now();
+  const newClient = { id: sseClientId, res };
   sseClients.push(newClient);
 
   // Send initial data immediately to the newly connected client
@@ -604,7 +605,7 @@ app.get('/api/events', (req, res) => {
   });
 
   req.on('close', () => {
-    const index = sseClients.findIndex(c => c.id === clientId);
+    const index = sseClients.findIndex(c => c.id === sseClientId);
     if (index !== -1) {
       sseClients.splice(index, 1);
     }
@@ -1124,7 +1125,8 @@ async function processQueue(userId) {
         }
 
         const channel = client.channels.cache.get(targetChannelId) || await client.channels.fetch(targetChannelId).catch(() => null);
-        if (!channel) {
+        const hasInteraction = !!(item.interaction || item.interactionToken || item.interaction?.token);
+        if (!channel && !hasInteraction) {
           throw new Error(`Channel ${targetChannelId} could not be resolved.`);
         }
 
@@ -1132,21 +1134,23 @@ async function processQueue(userId) {
         let sentWebhook = null;
         let viaWebhook = false;
 
-        const webhook = await getRotatedWebhook(channel, client.user);
-        if (webhook) {
-          try {
-            const webhookSendOptions = {
-              username: 'Panda Spammer Helper',
-              avatarURL: client.user.displayAvatarURL(),
-              wait: true,
-              ...sendOptions
-            };
-            const response = await webhook.send(webhookSendOptions);
-            msgId = response.id;
-            sentWebhook = webhook;
-            viaWebhook = true;
-          } catch (webhookErr) {
-            await logError(`Webhook send failed, falling back: ${webhookErr.message}`, webhookErr.code, userId, targetChannelId, channel.guild?.id);
+        if (channel) {
+          const webhook = await getRotatedWebhook(channel, client.user);
+          if (webhook) {
+            try {
+              const webhookSendOptions = {
+                username: 'Panda Spammer Helper',
+                avatarURL: client.user.displayAvatarURL(),
+                wait: true,
+                ...sendOptions
+              };
+              const response = await webhook.send(webhookSendOptions);
+              msgId = response.id;
+              sentWebhook = webhook;
+              viaWebhook = true;
+            } catch (webhookErr) {
+              await logError(`Webhook send failed, falling back: ${webhookErr.message}`, webhookErr.code, userId, targetChannelId, channel.guild?.id);
+            }
           }
         }
 
@@ -1155,11 +1159,27 @@ async function processQueue(userId) {
             const msg = await item.interaction.followUp(sendOptions);
             msgId = msg.id;
           } catch (intErr) {
-            await logError(`Interaction followUp failed: ${intErr.message}`, intErr.code, userId, targetChannelId, channel.guild?.id);
+            await logError(`Interaction followUp failed: ${intErr.message}`, intErr.code, userId, targetChannelId, channel?.guild?.id);
+          }
+        }
+
+        const interactionToken = item.interactionToken || item.interaction?.token;
+        if (!msgId && interactionToken && clientId) {
+          try {
+            const wh = new WebhookClient({ id: clientId, token: interactionToken });
+            const response = await wh.send(sendOptions);
+            msgId = response.id;
+            sentWebhook = wh;
+            viaWebhook = true;
+          } catch (intErr) {
+            await logError(`Interaction token send failed: ${intErr.message}`, intErr.code, userId, targetChannelId, channel?.guild?.id);
           }
         }
 
         if (!msgId) {
+          if (!channel) {
+            throw new Error(`Channel ${targetChannelId} could not be resolved and no valid interaction token was available for fallback.`);
+          }
           try {
             const msg = await channel.send(sendOptions);
             msgId = msg.id;
