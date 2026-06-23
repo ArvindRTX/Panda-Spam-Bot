@@ -1245,6 +1245,31 @@ async function processQueue(userId) {
             console.error('[Database] Failed to delete queue item after failure:', dbErr.message);
           }
         }
+
+        // Clean up remaining queue items if the error is fatal (expired token or missing channel access)
+        const isFatal = 
+          itemErr.code === 50027 || // Invalid Webhook Token
+          itemErr.code === 10015 || // Unknown Webhook
+          itemErr.code === 50001 || // Missing Access
+          itemErr.message.includes('could not be resolved') ||
+          itemErr.message.includes('Missing Access');
+
+        if (isFatal) {
+          console.warn(`[Queue Worker] Fatal error encountered. Clearing remaining ${userData.queue.length} queue items for user ${userId} to prevent log spam.`);
+          if (databaseUrl && userData.queue.length > 0) {
+            const dbQueueIds = userData.queue.map(q => q.dbQueueId).filter(Boolean);
+            if (dbQueueIds.length > 0) {
+              try {
+                await pool.query('DELETE FROM active_queues WHERE id = ANY($1)', [dbQueueIds]);
+                console.log(`[Database] Cleaned up ${dbQueueIds.length} stale queue items for user ${userId}.`);
+              } catch (dbErr) {
+                console.error('[Database] Failed to bulk delete stale queue items:', dbErr.message);
+              }
+            }
+          }
+          userData.queue = [];
+          broadcastQueues();
+        }
       }
 
       if (userData.queue.length > 0) {
