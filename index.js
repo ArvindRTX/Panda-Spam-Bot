@@ -9,7 +9,9 @@ import {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
-  InteractionType
+  InteractionType,
+  WebhookClient,
+  PermissionsBitField
 } from 'discord.js';
 import 'dotenv/config';
 import express from 'express';
@@ -19,6 +21,8 @@ const { Pool } = pg;
 const token = process.env.DISCORD_TOKEN;
 const databaseUrl = process.env.DATABASE_URL;
 const ownerId = process.env.OWNER_ID;
+const clientSecret = process.env.CLIENT_SECRET;
+const redirectUri = process.env.REDIRECT_URI;
 
 const authorizedUsers = process.env.AUTHORIZED_USERS
   ? process.env.AUTHORIZED_USERS.split(',').map(id => id.trim())
@@ -28,6 +32,12 @@ const pool = new Pool({
   connectionString: databaseUrl,
   ssl: databaseUrl ? { rejectUnauthorized: false } : false
 });
+
+// Advanced Features Global State
+const activeSessions = new Map();
+const localErrorLogs = [];
+const channelWebhooksCache = new Map();
+const channelWebhookIndex = new Map();
 
 async function initDb() {
   if (!databaseUrl) {
@@ -90,9 +100,59 @@ async function initDb() {
       await pool.query('ALTER TABLE spam_sessions ADD COLUMN IF NOT EXISTS embed_title VARCHAR(200) NULL');
       await pool.query('ALTER TABLE spam_sessions ADD COLUMN IF NOT EXISTS embed_image_url VARCHAR(500) NULL');
       await pool.query('ALTER TABLE spam_sessions ADD COLUMN IF NOT EXISTS embed_color VARCHAR(10) NULL');
+      await pool.query('ALTER TABLE spam_sessions ADD COLUMN IF NOT EXISTS ghost_spam BOOLEAN DEFAULT FALSE');
+      await pool.query('ALTER TABLE spam_sessions ADD COLUMN IF NOT EXISTS panda_raid BOOLEAN DEFAULT FALSE');
     } catch (alterErr) {
       console.warn('[Database] Alter spam_sessions warning:', alterErr.message);
     }
+    
+    // Create new tables for advanced features
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS active_queues (
+        id SERIAL PRIMARY KEY,
+        user_id VARCHAR(30) NOT NULL,
+        username VARCHAR(100),
+        guild_id VARCHAR(30),
+        channel_id VARCHAR(30) NOT NULL,
+        message_text TEXT NOT NULL,
+        delay_ms INTEGER DEFAULT 100,
+        use_tts BOOLEAN DEFAULT FALSE,
+        use_embed BOOLEAN DEFAULT FALSE,
+        self_destruct_seconds INTEGER DEFAULT 0,
+        ghost_spam BOOLEAN DEFAULT FALSE,
+        panda_raid BOOLEAN DEFAULT FALSE,
+        embed_title VARCHAR(200) NULL,
+        embed_image_url VARCHAR(500) NULL,
+        embed_color VARCHAR(10) NULL,
+        interaction_token TEXT NULL,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sent_messages (
+        id VARCHAR(30) PRIMARY KEY,
+        user_id VARCHAR(30) NOT NULL,
+        channel_id VARCHAR(30) NOT NULL,
+        webhook_id VARCHAR(30) NULL,
+        webhook_token TEXT NULL,
+        interaction_token TEXT NULL,
+        sent_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS error_logs (
+        id SERIAL PRIMARY KEY,
+        error_message TEXT NOT NULL,
+        error_code VARCHAR(50) NULL,
+        user_id VARCHAR(30) NULL,
+        channel_id VARCHAR(30) NULL,
+        guild_id VARCHAR(30) NULL,
+        timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
     console.log('[Database] PostgreSQL tables initialized successfully.');
   } catch (error) {
     console.error('[Database] Failed to initialize database:', error.message);
@@ -128,15 +188,29 @@ const adminPassword = process.env.ADMIN_PASSWORD || 'admin';
 app.use(express.json());
 app.use(express.static('public'));
 
-// Password authorization middleware
+// Password & Session authorization middleware
 function requireAuth(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
-  if (token === adminPassword) {
-    next();
-  } else {
-    res.status(401).json({ error: 'Unauthorized' });
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized' });
   }
+
+  if (token === adminPassword) {
+    req.userId = ownerId || 'WebOwner';
+    req.username = 'Dashboard Owner';
+    return next();
+  }
+
+  const session = activeSessions.get(token);
+  if (session && session.expiresAt > Date.now()) {
+    session.expiresAt = Date.now() + 24 * 60 * 60 * 1000; // extend session
+    req.userId = session.userId;
+    req.username = session.username;
+    return next();
+  }
+
+  res.status(401).json({ error: 'Unauthorized' });
 }
 
 // Authentication verification endpoint
@@ -146,6 +220,223 @@ app.post('/api/verify-auth', (req, res) => {
     res.json({ success: true });
   } else {
     res.status(401).json({ error: 'Invalid password' });
+  }
+});
+
+// Config endpoint to expose OAuth status
+app.get('/api/config', (req, res) => {
+  const clientIdEnv = process.env.CLIENT_ID;
+  res.json({
+    oauthEnabled: !!(clientIdEnv && clientSecret && redirectUri)
+  });
+});
+
+// OAuth2 Url generator
+app.get('/api/auth/url', (req, res) => {
+  const clientIdEnv = process.env.CLIENT_ID;
+  if (!clientIdEnv || !redirectUri) {
+    return res.status(400).json({ error: 'OAuth2 configuration is incomplete.' });
+  }
+  const url = `https://discord.com/api/oauth2/authorize?client_id=${clientIdEnv}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=code&scope=identify`;
+  res.json({ url });
+});
+
+// OAuth2 Callback handler
+app.get('/api/auth/callback', async (req, res) => {
+  const { code } = req.query;
+  const clientIdEnv = process.env.CLIENT_ID;
+  if (!code) {
+    return res.redirect('/?error=No+authorization+code+provided');
+  }
+
+  try {
+    const tokenResponse = await fetch('https://discord.com/api/v10/oauth2/token', {
+      method: 'POST',
+      body: new URLSearchParams({
+        client_id: clientIdEnv,
+        client_secret: clientSecret,
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: redirectUri,
+      }),
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+    });
+
+    const tokenData = await tokenResponse.json();
+    if (!tokenResponse.ok) {
+      console.error('[OAuth2] Token exchange failed:', tokenData);
+      return res.redirect(`/?error=${encodeURIComponent(tokenData.error_description || 'Token exchange failed')}`);
+    }
+
+    const accessToken = tokenData.access_token;
+
+    const userResponse = await fetch('https://discord.com/api/v10/users/@me', {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+
+    const userData = await userResponse.json();
+    if (!userResponse.ok) {
+      console.error('[OAuth2] Fetching user info failed:', userData);
+      return res.redirect('/?error=Failed+to+fetch+user+info');
+    }
+
+    const userId = userData.id;
+    const authorized = await isUserAuthorized(userId);
+    if (!authorized) {
+      return res.redirect('/?error=You+are+not+authorized+to+access+the+dashboard');
+    }
+
+    const sessionToken = Math.random().toString(36).slice(2) + Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const userTag = userData.discriminator && userData.discriminator !== '0' 
+      ? `${userData.username}#${userData.discriminator}` 
+      : userData.username;
+
+    activeSessions.set(sessionToken, {
+      userId,
+      username: userTag,
+      expiresAt: Date.now() + 24 * 60 * 60 * 1000
+    });
+
+    res.redirect(`/?token=${sessionToken}`);
+  } catch (err) {
+    console.error('[OAuth2] Auth Callback Error:', err);
+    res.redirect(`/?error=${encodeURIComponent(err.message)}`);
+  }
+});
+
+// Diagnostics Logs endpoint
+app.get('/api/diagnostics', requireAuth, async (req, res) => {
+  try {
+    const errors = await getDiagnosticsData();
+    res.json({ errors });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Web Console Spam Trigger endpoint
+app.post('/api/spam/trigger', requireAuth, async (req, res) => {
+  const {
+    channelId,
+    messageText,
+    delay = 100,
+    tts = false,
+    embed = false,
+    selfDestruct = 0,
+    ghostSpam = false,
+    pandaRaid = false,
+    embedTitle = '',
+    embedImageUrl = '',
+    embedColor = ''
+  } = req.body;
+
+  if (!channelId) {
+    return res.status(400).json({ error: 'Target Channel ID is required' });
+  }
+  if (!pandaRaid && !messageText) {
+    return res.status(400).json({ error: 'Message Text is required when Panda Raid is disabled' });
+  }
+
+  const userId = req.userId;
+  const username = req.username;
+
+  try {
+    const count = 5;
+    const sessionItems = [];
+
+    const channel = client.channels.cache.get(channelId) || await client.channels.fetch(channelId).catch(() => null);
+    if (!channel) {
+      return res.status(400).json({ error: `Channel ${channelId} could not be resolved or bot is not in that guild.` });
+    }
+
+    if (databaseUrl) {
+      for (let i = 0; i < count; i++) {
+        const insertRes = await pool.query(
+          `INSERT INTO active_queues (
+            user_id, username, guild_id, channel_id, message_text, delay_ms, use_tts, use_embed, 
+            self_destruct_seconds, ghost_spam, panda_raid, embed_title, embed_image_url, embed_color
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id`,
+          [
+            userId, username, channel.guild?.id || null, channelId, messageText || '', delay, tts, embed,
+            selfDestruct, ghostSpam, pandaRaid, embedTitle || null, embedImageUrl || null, embedColor || null
+          ]
+        );
+        sessionItems.push({
+          dbQueueId: insertRes.rows[0].id,
+          messageText,
+          channelId,
+          tts,
+          embed,
+          delay,
+          selfDestruct,
+          ghostSpam,
+          pandaRaid,
+          embedTitle,
+          embedImageUrl,
+          embedColor,
+          itemIndex: i
+        });
+      }
+    } else {
+      for (let i = 0; i < count; i++) {
+        sessionItems.push({
+          messageText,
+          channelId,
+          tts,
+          embed,
+          delay,
+          selfDestruct,
+          ghostSpam,
+          pandaRaid,
+          embedTitle,
+          embedImageUrl,
+          embedColor,
+          itemIndex: i
+        });
+      }
+    }
+
+    if (!userSpams.has(userId)) {
+      userSpams.set(userId, { queue: [], sending: false, messages: [], username });
+    }
+    const userData = userSpams.get(userId);
+    userData.username = username;
+    userData.currentMessage = pandaRaid ? '🐼 Panda Raid Active!' : messageText;
+
+    if (databaseUrl) {
+      try {
+        const guildName = channel.guild ? channel.guild.name : null;
+        await pool.query(
+          'INSERT INTO spam_logs (user_id, username, guild_id, guild_name, channel_id, message_text, click_count) VALUES ($1, $2, $3, $4, $5, $6, 1)',
+          [
+            userId,
+            username,
+            channel.guildId || null,
+            guildName,
+            channelId,
+            (pandaRaid ? '🐼 Panda Raid' : messageText).slice(0, 200)
+          ]
+        );
+        broadcastLogs();
+        broadcastStats();
+        broadcastAnalytics();
+      } catch (dbErr) {
+        console.error('[Database] Failed to log dashboard spam trigger:', dbErr.message);
+      }
+    }
+
+    userData.queue.push(...sessionItems);
+    broadcastQueues();
+
+    processQueue(userId);
+
+    res.json({ success: true, message: `Spam queue initiated successfully for channel ${channelId}` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -275,7 +566,8 @@ app.get('/api/logs', requireAuth, async (req, res) => {
 // SSE Events endpoint
 app.get('/api/events', (req, res) => {
   const token = req.query.token;
-  if (token !== adminPassword) {
+  const isValidSession = activeSessions.has(token) && activeSessions.get(token).expiresAt > Date.now();
+  if (token !== adminPassword && !isValidSession) {
     return res.status(401).end();
   }
 
@@ -303,6 +595,9 @@ app.get('/api/events', (req, res) => {
 
       const analytics = await getAnalyticsData();
       res.write(`event: analytics\ndata: ${JSON.stringify(analytics)}\n\n`);
+
+      const errors = await getDiagnosticsData();
+      res.write(`event: diagnostics\ndata: ${JSON.stringify(errors)}\n\n`);
     } catch (err) {
       console.error('[SSE] Error sending initial data:', err.message);
     }
@@ -611,7 +906,153 @@ async function broadcastAnalytics() {
 
 
 
-// Helper to process a user's spam queue sequentially
+// Global error logging helper
+async function logError(errMessage, errCode = null, userId = null, channelId = null, guildId = null) {
+  console.error(`[Error Log] ${errMessage} (Code: ${errCode})`);
+  if (databaseUrl) {
+    try {
+      await pool.query(
+        'INSERT INTO error_logs (error_message, error_code, user_id, channel_id, guild_id) VALUES ($1, $2, $3, $4, $5)',
+        [errMessage, errCode, userId, channelId, guildId]
+      );
+      broadcastDiagnostics();
+    } catch (dbErr) {
+      console.error('[Database] Failed to save error log:', dbErr.message);
+    }
+  } else {
+    localErrorLogs.unshift({
+      id: Date.now() + Math.random(),
+      error_message: errMessage,
+      error_code: errCode,
+      user_id: userId,
+      channel_id: channelId,
+      guild_id: guildId,
+      timestamp: new Date()
+    });
+    if (localErrorLogs.length > 50) localErrorLogs.pop();
+    broadcastDiagnostics();
+  }
+}
+
+async function getDiagnosticsData() {
+  if (databaseUrl) {
+    try {
+      const dbRes = await pool.query('SELECT id, error_message, error_code, user_id, channel_id, guild_id, timestamp FROM error_logs ORDER BY timestamp DESC LIMIT 50');
+      return dbRes.rows;
+    } catch (err) {
+      console.error('[Database] Failed to fetch error logs for diagnostics:', err.message);
+      return [];
+    }
+  }
+  return localErrorLogs;
+}
+
+async function broadcastDiagnostics() {
+  try {
+    const data = await getDiagnosticsData();
+    broadcastSSE('diagnostics', data);
+  } catch (err) {
+    console.error('[SSE] Failed to broadcast diagnostics:', err.message);
+  }
+}
+
+// Formatting dynamic spam variables
+function formatSpamMessage(text, index, userId) {
+  let formatted = text || '';
+  formatted = formatted.replace(/{count}/g, (index + 1).toString());
+  
+  const now = new Date();
+  const timeStr = now.toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false });
+  formatted = formatted.replace(/{time}/g, timeStr);
+  
+  const emojis = ['🐼', '🐨', '🐾', '🍃', '🎋', '✨', '🔥', '💥', '⚡', '🎉', '❤️', '🌟'];
+  formatted = formatted.replace(/{random_emoji}/g, () => emojis[Math.floor(Math.random() * emojis.length)]);
+  
+  if (userId) {
+    formatted = formatted.replace(/{ping_user}/g, `<@${userId}>`);
+  }
+  
+  return formatted;
+}
+
+// Multi-message rotation and variable replacement
+function processSpamText(text, index, userId) {
+  let baseText = text || '';
+  if (baseText.includes('||')) {
+    const parts = baseText.split('||').map(p => p.trim());
+    baseText = parts[index % parts.length];
+  }
+  return formatSpamMessage(baseText, index, userId);
+}
+
+// Webhook Auto-Rotation (bypassing rate limits)
+async function getRotatedWebhook(channel, clientUser) {
+  const channelId = channel.id;
+  if (!channel.guild || !channel.createWebhook || !channel.fetchWebhooks) {
+    return null;
+  }
+
+  // Resolve bot member permissions
+  const botMember = channel.guild.members.cache.get(clientUser.id) || await channel.guild.members.fetch(clientUser.id).catch(() => null);
+  if (!botMember) return null;
+  
+  const permissions = channel.permissionsFor(botMember);
+  if (!permissions || !permissions.has(PermissionsBitField.Flags.ManageWebhooks) || !permissions.has(PermissionsBitField.Flags.SendMessages)) {
+    return null;
+  }
+
+  if (channelWebhooksCache.has(channelId)) {
+    const cached = channelWebhooksCache.get(channelId);
+    if (cached && cached.length > 0) {
+      return getNextWebhookFromCache(channelId, cached);
+    }
+  }
+
+  try {
+    const webhooks = await channel.fetchWebhooks();
+    const prefix = 'Panda Helper ';
+    let helpers = webhooks.filter(wh => wh.name.startsWith(prefix));
+    let helperList = Array.from(helpers.values());
+
+    const desiredCount = 3;
+    const currentCount = helperList.length;
+    
+    if (currentCount < desiredCount) {
+      const avatarUrl = clientUser.displayAvatarURL() || null;
+      for (let i = currentCount + 1; i <= desiredCount; i++) {
+        try {
+          const newWh = await channel.createWebhook({
+            name: `${prefix}${i}`,
+            avatar: avatarUrl,
+            reason: 'Panda Spam Bot Webhook Rotation'
+          });
+          helperList.push(newWh);
+        } catch (createErr) {
+          console.warn(`[Webhook Pool] Failed to create webhook ${prefix}${i}:`, createErr.message);
+          break;
+        }
+      }
+    }
+
+    if (helperList.length > 0) {
+      channelWebhooksCache.set(channelId, helperList);
+      return getNextWebhookFromCache(channelId, helperList);
+    }
+  } catch (err) {
+    console.warn(`[Webhook Pool] Error fetching/creating webhooks for channel ${channelId}:`, err.message);
+  }
+
+  return null;
+}
+
+function getNextWebhookFromCache(channelId, webhooks) {
+  let idx = channelWebhookIndex.get(channelId) || 0;
+  const webhook = webhooks[idx % webhooks.length];
+  channelWebhookIndex.set(channelId, (idx + 1) % webhooks.length);
+  return webhook;
+}
+
+// Sequential queue worker
 async function processQueue(userId) {
   const userData = userSpams.get(userId);
   if (!userData || userData.sending || userData.queue.length === 0) {
@@ -622,11 +1063,30 @@ async function processQueue(userId) {
   broadcastQueues();
 
   try {
+    let sentCount = 0;
     while (userData.queue.length > 0) {
       const item = userData.queue.shift();
       broadcastQueues();
 
+      const itemIndex = item.itemIndex ?? sentCount;
+      sentCount++;
+
       try {
+        let finalContent = '';
+        if (item.pandaRaid) {
+          const pandaRaidMessages = [
+            "🐼 Panda Raid! Cute pandas are taking over! 🎋",
+            "🐼 *Rolls into the channel* 🎋",
+            "🐼 Did you know? Giant pandas spend 12 hours a day eating bamboo! 🎋",
+            "🐼 Panda Power! ✨🐾✨",
+            "🐼 🎋 🐼 🎋 🐼 🎋 🐼 🎋 🐼",
+            "🐼 P-A-N-D-A! *dances around* 🐼"
+          ];
+          finalContent = pandaRaidMessages[itemIndex % pandaRaidMessages.length];
+        } else {
+          finalContent = processSpamText(item.messageText, itemIndex, userId);
+        }
+
         const sendOptions = {
           tts: item.tts || false
         };
@@ -641,8 +1101,8 @@ async function processQueue(userId) {
           
           const embedData = {
             color: hexColor,
-            title: item.embedTitle || null,
-            description: item.messageText,
+            title: item.embedTitle ? formatSpamMessage(item.embedTitle, itemIndex, userId) : null,
+            description: finalContent,
             timestamp: new Date().toISOString(),
             footer: {
               text: 'Panda Spammer Pro 🐼'
@@ -655,40 +1115,110 @@ async function processQueue(userId) {
 
           sendOptions.embeds = [embedData];
         } else {
-          sendOptions.content = item.messageText;
+          sendOptions.content = finalContent;
         }
 
-        const msg = await item.interaction.followUp(sendOptions);
-        userData.messages.push({
-          id: msg.id,
-          channelId: msg.channelId,
-          webhook: item.interaction.webhook
-        });
-        console.log(`[Spam] Sent message ${msg.id} for user ${userId}`);
+        const targetChannelId = item.channelId || item.interaction?.channelId;
+        if (!targetChannelId) {
+          throw new Error('Target channel ID not found.');
+        }
 
-        // Self-Destruct timer execution (asynchronous timeout)
-        if (item.selfDestruct && item.selfDestruct > 0) {
+        const channel = client.channels.cache.get(targetChannelId) || await client.channels.fetch(targetChannelId).catch(() => null);
+        if (!channel) {
+          throw new Error(`Channel ${targetChannelId} could not be resolved.`);
+        }
+
+        let msgId = null;
+        let sentWebhook = null;
+        let viaWebhook = false;
+
+        const webhook = await getRotatedWebhook(channel, client.user);
+        if (webhook) {
+          try {
+            const webhookSendOptions = {
+              username: 'Panda Spammer Helper',
+              avatarURL: client.user.displayAvatarURL(),
+              wait: true,
+              ...sendOptions
+            };
+            const response = await webhook.send(webhookSendOptions);
+            msgId = response.id;
+            sentWebhook = webhook;
+            viaWebhook = true;
+          } catch (webhookErr) {
+            await logError(`Webhook send failed, falling back: ${webhookErr.message}`, webhookErr.code, userId, targetChannelId, channel.guild?.id);
+          }
+        }
+
+        if (!msgId && item.interaction) {
+          try {
+            const msg = await item.interaction.followUp(sendOptions);
+            msgId = msg.id;
+          } catch (intErr) {
+            await logError(`Interaction followUp failed: ${intErr.message}`, intErr.code, userId, targetChannelId, channel.guild?.id);
+          }
+        }
+
+        if (!msgId) {
+          try {
+            const msg = await channel.send(sendOptions);
+            msgId = msg.id;
+          } catch (sendErr) {
+            await logError(`Direct channel send failed: ${sendErr.message}`, sendErr.code, userId, targetChannelId, channel.guild?.id);
+            throw sendErr;
+          }
+        }
+
+        const messageTracker = {
+          id: msgId,
+          channelId: targetChannelId,
+          webhook: viaWebhook && sentWebhook ? {
+            deleteMessage: async (id) => sentWebhook.deleteMessage(id)
+          } : (item.interaction ? {
+            deleteMessage: async (id) => item.interaction.webhook.deleteMessage(id)
+          } : null)
+        };
+        userData.messages.push(messageTracker);
+
+        if (databaseUrl) {
+          try {
+            const whId = viaWebhook ? sentWebhook.id : null;
+            const whToken = viaWebhook ? sentWebhook.token : null;
+            const intToken = (!viaWebhook && item.interaction) ? item.interaction.token : null;
+            await pool.query(
+              'INSERT INTO sent_messages (id, user_id, channel_id, webhook_id, webhook_token, interaction_token) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING',
+              [msgId, userId, targetChannelId, whId, whToken, intToken]
+            );
+          } catch (dbErr) {
+            console.error('[Database] Failed to persist sent message record:', dbErr.message);
+          }
+        }
+
+        if (databaseUrl && item.dbQueueId) {
+          try {
+            await pool.query('DELETE FROM active_queues WHERE id = $1', [item.dbQueueId]);
+          } catch (dbErr) {
+            console.error('[Database] Failed to delete queue item:', dbErr.message);
+          }
+        }
+
+        const selfDestructSec = item.selfDestruct || 0;
+        const isGhost = item.ghostSpam || false;
+        
+        if (isGhost) {
           setTimeout(async () => {
-            try {
-              await item.interaction.webhook.deleteMessage(msg.id);
-              console.log(`[Self-Destruct] Auto-deleted message ${msg.id}`);
-            } catch (webhookError) {
-              try {
-                const channel = await client.channels.fetch(msg.channelId);
-                const fetchedMsg = await channel.messages.fetch(msg.id);
-                await fetchedMsg.delete();
-                console.log(`[Self-Destruct] Auto-deleted message ${msg.id} via API fallback`);
-              } catch (deleteError) {
-                console.error(`[Self-Destruct Error] Failed to delete message ${msg.id}:`, deleteError.message);
-              }
-            }
-          }, item.selfDestruct * 1000);
+            await deleteMessageTracked(messageTracker, userId);
+          }, 500);
+        } else if (selfDestructSec > 0) {
+          setTimeout(async () => {
+            await deleteMessageTracked(messageTracker, userId);
+          }, selfDestructSec * 1000);
         }
-      } catch (loopError) {
-        console.error(`[Spam Queue Error] Failed to send follow-up message for user ${userId}:`, loopError.message);
+
+      } catch (itemErr) {
+        console.error(`[Spam Queue Item Failure] user ${userId}:`, itemErr.message);
       }
 
-      // Add a custom delay between messages to preserve order and avoid rate limits
       if (userData.queue.length > 0) {
         await new Promise(resolve => setTimeout(resolve, item.delay || 100));
       }
@@ -696,6 +1226,106 @@ async function processQueue(userId) {
   } finally {
     userData.sending = false;
     broadcastQueues();
+  }
+}
+
+// Delete tracker helper
+async function deleteMessageTracked(tracker, userId) {
+  try {
+    if (tracker.webhook && typeof tracker.webhook.deleteMessage === 'function') {
+      await tracker.webhook.deleteMessage(tracker.id);
+    } else {
+      const channel = await client.channels.fetch(tracker.channelId);
+      const fetchedMsg = await channel.messages.fetch(tracker.id);
+      await fetchedMsg.delete();
+    }
+    console.log(`[Unsend/Cleanup] Deleted message ${tracker.id}`);
+  } catch (err) {
+    console.warn(`[Unsend/Cleanup Error] Failed to delete message ${tracker.id}: ${err.message}`);
+  }
+  
+  if (databaseUrl) {
+    try {
+      await pool.query('DELETE FROM sent_messages WHERE id = $1', [tracker.id]);
+    } catch (dbErr) {
+      console.error('[Database] Failed to delete sent_message record:', dbErr.message);
+    }
+  }
+  
+  const userData = userSpams.get(userId);
+  if (userData) {
+    userData.messages = userData.messages.filter(m => m.id !== tracker.id);
+    broadcastQueues();
+  }
+}
+
+// Recover active queues from DB on startup
+async function recoverQueues() {
+  if (!databaseUrl) return;
+  try {
+    const res = await pool.query('SELECT * FROM active_queues ORDER BY created_at ASC');
+    if (res.rowCount === 0) return;
+
+    console.log(`[Queue Recovery] Recovered ${res.rowCount} queued messages from database. Resuming...`);
+
+    const userItemsMap = new Map();
+    for (const row of res.rows) {
+      if (!userItemsMap.has(row.user_id)) {
+        userItemsMap.set(row.user_id, []);
+      }
+      userItemsMap.get(row.user_id).push(row);
+    }
+
+    for (const [userId, items] of userItemsMap) {
+      if (!userSpams.has(userId)) {
+        userSpams.set(userId, {
+          queue: [],
+          sending: false,
+          messages: [],
+          username: items[0].username || 'Unknown'
+        });
+      }
+      const userData = userSpams.get(userId);
+      
+      const sentMsgsRes = await pool.query('SELECT id, channel_id, webhook_id, webhook_token, interaction_token FROM sent_messages WHERE user_id = $1', [userId]);
+      userData.messages = sentMsgsRes.rows.map(sm => ({
+        id: sm.id,
+        channelId: sm.channel_id,
+        webhook: sm.webhook_id ? {
+          deleteMessage: async (msgId) => {
+            const wh = new WebhookClient({ id: sm.webhook_id, token: sm.webhook_token });
+            return wh.deleteMessage(msgId);
+          }
+        } : (sm.interaction_token ? {
+          deleteMessage: async (msgId) => {
+            const wh = new WebhookClient({ id: clientId, token: sm.interaction_token });
+            return wh.deleteMessage(msgId);
+          }
+        } : null)
+      }));
+
+      for (const item of items) {
+        userData.queue.push({
+          dbQueueId: item.id,
+          messageText: item.message_text,
+          channelId: item.channel_id,
+          tts: item.use_tts,
+          embed: item.use_embed,
+          delay: item.delay_ms,
+          selfDestruct: item.self_destruct_seconds,
+          ghostSpam: item.ghost_spam,
+          pandaRaid: item.panda_raid,
+          embedTitle: item.embed_title,
+          embedImageUrl: item.embed_image_url,
+          embedColor: item.embed_color,
+          interactionToken: item.interaction_token
+        });
+      }
+      
+      processQueue(userId);
+    }
+  } catch (err) {
+    console.error('[Queue Recovery] Failed to recover active queues:', err.message);
   }
 }
 
@@ -710,6 +1340,9 @@ client.once(Events.ClientReady, async () => {
 
   // Initialize database
   await initDb();
+
+  // Recover active queues from database
+  await recoverQueues();
 
   try {
     console.log('Attempting to update profile picture using cute-dancing-panda.gif...');
@@ -907,12 +1540,41 @@ client.on('interactionCreate', async (interaction) => {
           }
         }
 
-        if (userData && userData.messages.length > 0) {
-          // Deleting messages
-          const messagesToDelete = [...userData.messages];
-          userData.messages = []; // Clear local list immediately to prevent double-deletes
-          broadcastQueues();
+        let messagesToDelete = [];
+        if (databaseUrl) {
+          try {
+            const dbRes = await pool.query('SELECT id, channel_id, webhook_id, webhook_token, interaction_token FROM sent_messages WHERE user_id = $1', [userId]);
+            messagesToDelete = dbRes.rows.map(sm => ({
+              id: sm.id,
+              channelId: sm.channel_id,
+              webhook: sm.webhook_id ? {
+                deleteMessage: async (msgId) => {
+                  const wh = new WebhookClient({ id: sm.webhook_id, token: sm.webhook_token });
+                  return wh.deleteMessage(msgId);
+                }
+              } : (sm.interaction_token ? {
+                deleteMessage: async (msgId) => {
+                  const wh = new WebhookClient({ id: clientId, token: sm.interaction_token });
+                  return wh.deleteMessage(msgId);
+                }
+              } : null)
+            }));
+          } catch (dbErr) {
+            console.error('[Database] Failed to fetch sent messages for unsend:', dbErr.message);
+          }
+        }
 
+        if (userData && userData.messages.length > 0) {
+          for (const m of userData.messages) {
+            if (!messagesToDelete.some(sm => sm.id === m.id)) {
+              messagesToDelete.push(m);
+            }
+          }
+          userData.messages = []; // Clear local list immediately to prevent double-deletes
+        }
+        broadcastQueues();
+
+        if (messagesToDelete.length > 0) {
           await interaction.reply({
             content: '🧹 Deleting spam messages to clean traces...',
             flags: MessageFlags.Ephemeral
@@ -920,22 +1582,26 @@ client.on('interactionCreate', async (interaction) => {
 
           const deletePromises = messagesToDelete.map(async (item) => {
             try {
-              console.log(`[Unsend] Deleting message: ${item.id}`);
-              // Try webhook deletion first (fast, works in user-installed non-member guild channels)
-              await item.webhook.deleteMessage(item.id);
-              return true;
-            } catch (webhookError) {
-              console.warn(`[Unsend Webhook Warning] Webhook deletion failed for message ${item.id}: ${webhookError.message}. Falling back to API channel fetch...`);
-              try {
-                // Fallback to fetching channel and message via bot token
+              if (item.webhook) {
+                await item.webhook.deleteMessage(item.id);
+              } else {
                 const channel = await client.channels.fetch(item.channelId);
                 const fetchedMsg = await channel.messages.fetch(item.id);
                 await fetchedMsg.delete();
-                return true;
-              } catch (deleteError) {
-                console.error(`[Unsend Error] Failed to delete message ${item.id}:`, deleteError.message);
-                return false;
               }
+              if (databaseUrl) {
+                await pool.query('DELETE FROM sent_messages WHERE id = $1', [item.id]).catch(() => {});
+              }
+              return true;
+            } catch (err) {
+              if (err.code === 10008 || err.message.includes('Unknown Message') || err.message.includes('Not Found')) {
+                if (databaseUrl) {
+                  await pool.query('DELETE FROM sent_messages WHERE id = $1', [item.id]).catch(() => {});
+                }
+                return true;
+              }
+              console.error(`[Unsend Error] Failed to delete message ${item.id}:`, err.message);
+              return false;
             }
           });
 
@@ -1247,10 +1913,38 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         // Gather all messages to delete
-        const allMessages = [];
-        userSpams.forEach((userData) => {
+        let allMessages = [];
+        if (databaseUrl) {
+          try {
+            const dbRes = await pool.query('SELECT id, user_id, channel_id, webhook_id, webhook_token, interaction_token FROM sent_messages');
+            allMessages = dbRes.rows.map(sm => ({
+              id: sm.id,
+              userId: sm.user_id,
+              channelId: sm.channel_id,
+              webhook: sm.webhook_id ? {
+                deleteMessage: async (msgId) => {
+                  const wh = new WebhookClient({ id: sm.webhook_id, token: sm.webhook_token });
+                  return wh.deleteMessage(msgId);
+                }
+              } : (sm.interaction_token ? {
+                deleteMessage: async (msgId) => {
+                  const wh = new WebhookClient({ id: clientId, token: sm.interaction_token });
+                  return wh.deleteMessage(msgId);
+                }
+              } : null)
+            }));
+          } catch (dbErr) {
+            console.error('[Database] Failed to fetch sent messages for unsendall:', dbErr.message);
+          }
+        }
+
+        userSpams.forEach((userData, userId) => {
           if (userData.messages.length > 0) {
-            allMessages.push(...userData.messages);
+            for (const m of userData.messages) {
+              if (!allMessages.some(sm => sm.id === m.id)) {
+                allMessages.push({ ...m, userId });
+              }
+            }
             userData.messages = []; // Clear local list immediately
           }
         });
@@ -1264,20 +1958,26 @@ client.on('interactionCreate', async (interaction) => {
 
           const deletePromises = allMessages.map(async (item) => {
             try {
-              // Try webhook deletion first
-              await item.webhook.deleteMessage(item.id);
-              return true;
-            } catch (webhookError) {
-              try {
-                // Fallback to bot token API channel fetch
+              if (item.webhook) {
+                await item.webhook.deleteMessage(item.id);
+              } else {
                 const channel = await client.channels.fetch(item.channelId);
                 const fetchedMsg = await channel.messages.fetch(item.id);
                 await fetchedMsg.delete();
-                return true;
-              } catch (deleteError) {
-                console.error(`[Unsendall Error] Failed to delete message ${item.id}:`, deleteError.message);
-                return false;
               }
+              if (databaseUrl) {
+                await pool.query('DELETE FROM sent_messages WHERE id = $1', [item.id]).catch(() => {});
+              }
+              return true;
+            } catch (err) {
+              if (err.code === 10008 || err.message.includes('Unknown Message') || err.message.includes('Not Found')) {
+                if (databaseUrl) {
+                  await pool.query('DELETE FROM sent_messages WHERE id = $1', [item.id]).catch(() => {});
+                }
+                return true;
+              }
+              console.error(`[Unsendall Error] Failed to delete message ${item.id}:`, err.message);
+              return false;
             }
           });
 
@@ -1390,7 +2090,7 @@ client.on('interactionCreate', async (interaction) => {
         if (databaseUrl) {
           try {
             const res = await pool.query(
-              'SELECT message_text, spam_count, delay_ms, use_tts, use_embed, self_destruct_seconds, embed_title, embed_image_url, embed_color FROM spam_sessions WHERE session_id = $1',
+              'SELECT message_text, spam_count, delay_ms, use_tts, use_embed, self_destruct_seconds, ghost_spam, panda_raid, embed_title, embed_image_url, embed_color FROM spam_sessions WHERE session_id = $1',
               [sessionId]
             );
             if (res.rowCount > 0) {
@@ -1421,6 +2121,8 @@ client.on('interactionCreate', async (interaction) => {
         const tts = session.use_tts || false;
         const embed = session.use_embed || false;
         const selfDestruct = session.self_destruct_seconds || 0;
+        const ghostSpam = session.ghost_spam || false;
+        const pandaRaid = session.panda_raid || false;
         const embedTitle = session.embed_title || null;
         const embedImageUrl = session.embed_image_url || null;
         const embedColor = session.embed_color || null;
@@ -1431,7 +2133,7 @@ client.on('interactionCreate', async (interaction) => {
         }
         const userData = userSpams.get(userId);
         userData.username = interaction.user.tag || interaction.user.username;
-        userData.currentMessage = messageText;
+        userData.currentMessage = pandaRaid ? '🐼 Panda Raid Active!' : messageText;
 
         // Acknowledge the interaction immediately to prevent timeout silently
         await interaction.deferUpdate();
@@ -1439,24 +2141,21 @@ client.on('interactionCreate', async (interaction) => {
         // Log the spam initiation if database is configured (avoiding duplicates within 3 minutes)
         if (databaseUrl) {
           try {
-            // Check if there is an existing log for this user, channel, and message text in the last 3 minutes
             const checkLog = await pool.query(
               `SELECT id FROM spam_logs 
                WHERE user_id = $1 AND channel_id = $2 AND message_text = $3 
                AND initiated_at > NOW() - INTERVAL '3 minutes'
                ORDER BY initiated_at DESC LIMIT 1`,
-              [userId, interaction.channelId || null, messageText.slice(0, 200)]
+              [userId, interaction.channelId || null, (pandaRaid ? '🐼 Panda Raid' : messageText).slice(0, 200)]
             );
 
             if (checkLog.rowCount > 0) {
-              // Duplicate found! Increment click count instead of inserting new row
               const logId = checkLog.rows[0].id;
               await pool.query(
                 'UPDATE spam_logs SET click_count = click_count + 1, initiated_at = CURRENT_TIMESTAMP WHERE id = $1',
                 [logId]
               );
             } else {
-              // No recent duplicate. Insert fresh record.
               const guildName = interaction.guild ? interaction.guild.name : null;
               await pool.query(
                 'INSERT INTO spam_logs (user_id, username, guild_id, guild_name, channel_id, message_text, click_count) VALUES ($1, $2, $3, $4, $5, $6, 1)',
@@ -1466,7 +2165,7 @@ client.on('interactionCreate', async (interaction) => {
                   interaction.guildId || null,
                   guildName,
                   interaction.channelId || null,
-                  messageText.slice(0, 200)
+                  (pandaRaid ? '🐼 Panda Raid' : messageText).slice(0, 200)
                 ]
               );
             }
@@ -1478,20 +2177,62 @@ client.on('interactionCreate', async (interaction) => {
           }
         }
 
-        // Add customizable messages to the queue
-        for (let i = 0; i < count; i++) {
-          userData.queue.push({
-            messageText,
-            interaction,
-            tts,
-            embed,
-            delay,
-            selfDestruct,
-            embedTitle,
-            embedImageUrl,
-            embedColor
-          });
+        // Add customizable messages to the queue (persisted to database if configured)
+        const sessionItems = [];
+        if (databaseUrl) {
+          try {
+            for (let i = 0; i < count; i++) {
+              const insertRes = await pool.query(
+                `INSERT INTO active_queues (
+                  user_id, username, guild_id, channel_id, message_text, delay_ms, use_tts, use_embed, 
+                  self_destruct_seconds, ghost_spam, panda_raid, embed_title, embed_image_url, embed_color, interaction_token
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING id`,
+                [
+                  userId, userData.username, interaction.guildId || null, interaction.channelId || null, messageText || '', delay, tts, embed,
+                  selfDestruct, ghostSpam, pandaRaid, embedTitle || null, embedImageUrl || null, embedColor || null, interaction.token
+                ]
+              );
+              sessionItems.push({
+                dbQueueId: insertRes.rows[0].id,
+                messageText,
+                interaction,
+                tts,
+                embed,
+                delay,
+                selfDestruct,
+                ghostSpam,
+                pandaRaid,
+                embedTitle,
+                embedImageUrl,
+                embedColor,
+                itemIndex: i
+              });
+            }
+          } catch (dbErr) {
+            console.error('[Database] Failed to save active queue items:', dbErr.message);
+          }
         }
+
+        if (sessionItems.length === 0) {
+          for (let i = 0; i < count; i++) {
+            sessionItems.push({
+              messageText,
+              interaction,
+              tts,
+              embed,
+              delay,
+              selfDestruct,
+              ghostSpam,
+              pandaRaid,
+              embedTitle,
+              embedImageUrl,
+              embedColor,
+              itemIndex: i
+            });
+          }
+        }
+
+        userData.queue.push(...sessionItems);
         broadcastQueues();
 
         // Start processing the queue (it will self-gate if already sending)
