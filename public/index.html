@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Panda Spammer Pro | Admin Dashboard 🐼</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐼</text></svg>">
   <!-- Google Font: Outfit -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -11,6 +12,8 @@
   <!-- FontAwesome Icons -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <link rel="stylesheet" href="style.css">
+  <!-- Chart.js for premium analytics visualizations -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
 
@@ -103,49 +106,114 @@
       </div>
     </section>
 
+    <!-- Analytics Section -->
+    <section class="analytics-section">
+      <div class="analytics-layout">
+        <!-- Main Trend Chart -->
+        <div class="glass-card chart-card trend-card">
+          <div class="chart-header">
+            <h3><i class="fa-solid fa-chart-line" style="color: var(--accent-cyan);"></i> Spam Activity Trend (Last 24 Hours)</h3>
+          </div>
+          <div class="chart-container">
+            <canvas id="trend-chart"></canvas>
+          </div>
+        </div>
+
+        <!-- Breakdown Grid -->
+        <div class="analytics-subgrid">
+          <!-- Top Channels Chart -->
+          <div class="glass-card chart-card mini-chart-card">
+            <div class="chart-header">
+              <h3><i class="fa-solid fa-hashtag" style="color: var(--accent-pink);"></i> Top Target Channels</h3>
+            </div>
+            <div class="chart-container">
+              <canvas id="channels-chart"></canvas>
+            </div>
+          </div>
+
+          <!-- Top Users Chart -->
+          <div class="glass-card chart-card mini-chart-card">
+            <div class="chart-header">
+              <h3><i class="fa-solid fa-trophy" style="color: var(--accent-yellow);"></i> Spammer Leaderboard</h3>
+            </div>
+            <div class="chart-container">
+              <canvas id="users-chart"></canvas>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- Main Workspace Layout -->
     <main class="dashboard-main">
       
-      <!-- Left Panel: Access Management -->
-      <section class="glass-card panel-card flex-column">
-        <div class="panel-header">
-          <h2><i class="fa-solid fa-user-shield"></i> Access Control</h2>
-          <span class="badge" id="auth-users-count">0 Users</span>
-        </div>
-        
-        <!-- Add User Form -->
-        <form id="add-user-form" class="add-user-form">
-          <div class="input-group">
-            <i class="fa-solid fa-user-plus"></i>
-            <input type="text" id="new-user-id" placeholder="Enter Discord User ID" required pattern="\d{17,20}">
+      <!-- Left Column: Access & Active Sessions -->
+      <div class="dashboard-col">
+        <!-- Access Management -->
+        <section class="glass-card panel-card flex-column access-control-card">
+          <div class="panel-header">
+            <h2><i class="fa-solid fa-user-shield"></i> Access Control</h2>
+            <span class="badge" id="auth-users-count">0 Users</span>
           </div>
-          <button type="submit" class="btn btn-success">
-            <i class="fa-solid fa-check"></i>
-            <span>Authorize</span>
-          </button>
-        </form>
-        <div id="action-feedback" class="action-feedback"></div>
+          
+          <!-- Add User Form -->
+          <form id="add-user-form" class="add-user-form">
+            <div class="input-group">
+              <i class="fa-solid fa-user-plus"></i>
+              <input type="text" id="new-user-id" placeholder="Enter Discord User ID" required pattern="\d{17,20}">
+            </div>
+            <button type="submit" class="btn btn-success">
+              <i class="fa-solid fa-check"></i>
+              <span>Authorize</span>
+            </button>
+          </form>
+          <div id="action-feedback" class="action-feedback"></div>
 
-        <!-- Users List -->
-        <div class="list-wrapper scrollbar">
-          <div id="users-loading" class="spinner-container">
-            <i class="fa-solid fa-spinner fa-spin"></i>
-            <span>Fetching Users...</span>
+          <!-- Users List -->
+          <div class="list-wrapper scrollbar">
+            <div id="users-loading" class="spinner-container">
+              <i class="fa-solid fa-spinner fa-spin"></i>
+              <span>Fetching Users...</span>
+            </div>
+            <div id="users-list-container" class="users-list hidden">
+              <!-- Dynamic Users will be injected here -->
+            </div>
           </div>
-          <div id="users-list-container" class="users-list hidden">
-            <!-- Dynamic Users will be injected here -->
+        </section>
+
+        <!-- Active Spam Sessions -->
+        <section class="glass-card panel-card flex-column active-sessions-card">
+          <div class="panel-header">
+            <h2><i class="fa-solid fa-fire"></i> Active Spam Sessions</h2>
+            <span class="badge" id="active-queues-count" style="background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.2); color: var(--accent-red);">0 Active</span>
           </div>
-        </div>
-      </section>
+          
+          <div class="list-wrapper scrollbar">
+            <div id="active-queues-loading" class="spinner-container hidden">
+              <i class="fa-solid fa-spinner fa-spin"></i>
+              <span>Loading Active Sessions...</span>
+            </div>
+            <div id="active-queues-list-container" class="active-queues-list">
+              <div class="empty-placeholder">No active spam sequences running.</div>
+            </div>
+          </div>
+        </section>
+      </div>
 
       <!-- Right Panel: Spam Execution Audit Logs -->
       <section class="glass-card panel-card flex-column">
         <div class="panel-header">
           <h2><i class="fa-solid fa-file-invoice"></i> Spam Audit Logs</h2>
-          <button id="refresh-logs-btn" class="btn btn-primary-outline btn-sm">
-            <i class="fa-solid fa-rotate"></i>
-            <span>Refresh</span>
-          </button>
+          <div class="header-controls">
+            <div class="search-box">
+              <i class="fa-solid fa-magnifying-glass"></i>
+              <input type="text" id="log-search-input" placeholder="Search User, Guild, Channel ID...">
+            </div>
+            <button id="refresh-logs-btn" class="btn btn-primary-outline btn-sm">
+              <i class="fa-solid fa-rotate"></i>
+              <span>Refresh</span>
+            </button>
+          </div>
         </div>
 
         <!-- Audit Logs List -->

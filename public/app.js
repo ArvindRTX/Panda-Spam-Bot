@@ -1,7 +1,10 @@
 // Global State
 let adminPassword = localStorage.getItem('panda_admin_pass') || '';
-let statsPollInterval = null;
-let logsPollInterval = null;
+let sseSource = null;
+let allLogs = []; // Cache all logs for client-side search filtering
+let trendChart = null;
+let channelsChart = null;
+let usersChart = null;
 
 // DOM Elements
 const loginOverlay = document.getElementById('login-overlay');
@@ -32,6 +35,11 @@ const usersListContainer = document.getElementById('users-list-container');
 const refreshLogsBtn = document.getElementById('refresh-logs-btn');
 const logsLoading = document.getElementById('logs-loading');
 const logsListContainer = document.getElementById('logs-list-container');
+const logSearchInput = document.getElementById('log-search-input');
+
+// Active Queues elements
+const activeQueuesList = document.getElementById('active-queues-list-container');
+const activeQueuesCount = document.getElementById('active-queues-count');
 
 // Initial Setup
 document.addEventListener('DOMContentLoaded', () => {
@@ -43,6 +51,7 @@ document.addEventListener('DOMContentLoaded', () => {
   logoutBtn.addEventListener('click', handleLogout);
   addUserForm.addEventListener('submit', handleAuthorizeUser);
   refreshLogsBtn.addEventListener('click', () => loadLogs(true));
+  logSearchInput.addEventListener('input', filterAndRenderLogs);
 });
 
 // Helper for HTTP requests
@@ -85,7 +94,7 @@ async function verifyAuthentication(password) {
       appContainer.classList.remove('hidden');
       setConnectionStatus(true, 'Connected');
       
-      // Initialize Dashboard data
+      // Initialize Dashboard data & SSE stream connection
       initDashboard();
     } else {
       localStorage.removeItem('panda_admin_pass');
@@ -107,13 +116,21 @@ function handleLogin(e) {
 
 function handleLogout() {
   localStorage.removeItem('panda_admin_pass');
+  if (sseSource) {
+    sseSource.close();
+    sseSource = null;
+  }
+  destroyCharts();
   window.location.reload();
 }
 
 function handleUnauthorized() {
   localStorage.removeItem('panda_admin_pass');
-  clearInterval(statsPollInterval);
-  clearInterval(logsPollInterval);
+  if (sseSource) {
+    sseSource.close();
+    sseSource = null;
+  }
+  destroyCharts();
   appContainer.classList.add('hidden');
   loginOverlay.classList.remove('hidden');
   loginError.textContent = 'Session expired. Please log in again.';
@@ -129,37 +146,88 @@ function setConnectionStatus(connected, text) {
   }
 }
 
-// Dashboard Data Fetching & Polling
+// Dashboard Data Fetching & Real-time Sync
 function initDashboard() {
-  loadStatus();
+  // Load users once initially
   loadUsers();
-  loadLogs();
   
-  // Setup Polling intervals (every 10 seconds)
-  clearInterval(statsPollInterval);
-  statsPollInterval = setInterval(loadStatus, 10000);
+  // Close any existing EventSource
+  if (sseSource) {
+    sseSource.close();
+  }
   
-  clearInterval(logsPollInterval);
-  logsPollInterval = setInterval(loadLogs, 10000);
+  // Establish connection to Server-Sent Events
+  setConnectionStatus(false, 'Connecting...');
+  sseSource = new EventSource(`/api/events?token=${encodeURIComponent(adminPassword)}`);
+  
+  // Handle stats updates
+  sseSource.addEventListener('stats', (event) => {
+    try {
+      const stats = JSON.parse(event.data);
+      updateStatusUI(stats);
+      setConnectionStatus(true, 'Live Sync');
+    } catch (err) {
+      console.error('[SSE] Failed to parse stats event:', err);
+    }
+  });
+
+  // Handle logs updates
+  sseSource.addEventListener('logs', (event) => {
+    try {
+      const logs = JSON.parse(event.data);
+      allLogs = logs;
+      filterAndRenderLogs();
+    } catch (err) {
+      console.error('[SSE] Failed to parse logs event:', err);
+    }
+  });
+
+  // Handle active queues updates
+  sseSource.addEventListener('queues', (event) => {
+    try {
+      const queues = JSON.parse(event.data);
+      renderActiveQueues(queues);
+    } catch (err) {
+      console.error('[SSE] Failed to parse queues event:', err);
+    }
+  });
+
+  // Handle analytics updates
+  sseSource.addEventListener('analytics', (event) => {
+    try {
+      const analytics = JSON.parse(event.data);
+      updateCharts(analytics);
+    } catch (err) {
+      console.error('[SSE] Failed to parse analytics event:', err);
+    }
+  });
+
+  sseSource.onerror = (err) => {
+    console.error('[SSE] EventSource connection error:', err);
+    setConnectionStatus(false, 'Reconnecting...');
+  };
 }
 
-// Load System Status Metrics
+// Update Status Metrics UI
+function updateStatusUI(data) {
+  botStatusEl.textContent = data.status;
+  botStatusEl.className = 'metric-val ' + (data.status === 'Online' ? 'color-green' : 'color-pink');
+  
+  botUptimeEl.textContent = formatUptime(data.uptime);
+  botLatencyEl.textContent = `${data.latency} ms`;
+  botGuildsEl.textContent = data.guilds;
+  totalLogsEl.textContent = data.totalLogs;
+  authUsersCountEl.textContent = `${data.authorizedCount} Users`;
+  
+  // Save owner id globally for access list badge check
+  window.botOwnerId = data.ownerId;
+}
+
+// Manual Status Loader (fallback)
 async function loadStatus() {
   try {
     const data = await fetchAPI('/api/status');
-    
-    botStatusEl.textContent = data.status;
-    botStatusEl.className = 'metric-val ' + (data.status === 'Online' ? 'color-green' : 'color-pink');
-    
-    botUptimeEl.textContent = formatUptime(data.uptime);
-    botLatencyEl.textContent = `${data.latency} ms`;
-    botGuildsEl.textContent = data.guilds;
-    totalLogsEl.textContent = data.totalLogs;
-    authUsersCountEl.textContent = `${data.authorizedCount} Users`;
-    
-    // Save owner id globally for access list badge check
-    window.botOwnerId = data.ownerId;
-    
+    updateStatusUI(data);
     setConnectionStatus(true, 'Live Sync');
   } catch (error) {
     console.error('Status fetch failed:', error);
@@ -225,7 +293,7 @@ async function loadUsers() {
   }
 }
 
-// Load Spam Audit Logs
+// Manual/Fallback Logs Loader
 async function loadLogs(manual = false) {
   try {
     if (manual) {
@@ -234,63 +302,349 @@ async function loadLogs(manual = false) {
     }
     
     const data = await fetchAPI('/api/logs');
-    logsListContainer.innerHTML = '';
-    
-    if (data.logs.length === 0) {
-      logsListContainer.innerHTML = '<div class="spinner-container"><span>No audit logs recorded yet.</span></div>';
-    } else {
-      data.logs.forEach(log => {
-        const row = document.createElement('div');
-        row.className = 'log-row';
-        
-        const metaTop = document.createElement('div');
-        metaTop.className = 'log-meta-top';
-        
-        const userSpan = document.createElement('span');
-        userSpan.className = 'log-user';
-        userSpan.innerHTML = `<i class="fa-solid fa-user-ninja" style="color: var(--accent-pink); margin-right: 6px;"></i><span style="color: var(--accent-pink); font-weight:700;">${escapeHTML(log.username || 'Unknown')}</span> (\`${log.user_id}\`)`;
-        
-        const timeSpan = document.createElement('span');
-        timeSpan.className = 'log-time';
-        timeSpan.textContent = new Date(log.initiated_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST';
-        
-        metaTop.appendChild(userSpan);
-        metaTop.appendChild(timeSpan);
-        
-        const body = document.createElement('div');
-        body.className = 'log-body';
-        body.textContent = log.message_text;
-        
-        const metaBottom = document.createElement('div');
-        metaBottom.className = 'log-meta-bottom';
-        
-        const serverSpan = document.createElement('span');
-        serverSpan.innerHTML = `<i class="fa-solid fa-network-wired"></i> Guild ID: <code>${log.guild_id || 'DM'}</code>`;
-        
-        const channelSpan = document.createElement('span');
-        channelSpan.innerHTML = `<i class="fa-solid fa-hashtag"></i> Channel ID: <code>${log.channel_id || 'DM'}</code>`;
-
-        const clicksSpan = document.createElement('span');
-        const clickCount = log.click_count || 1;
-        clicksSpan.innerHTML = `<i class="fa-solid fa-arrow-pointer"></i> Clicks: <strong style="color: var(--accent-cyan);">${clickCount}</strong>`;
-        
-        metaBottom.appendChild(serverSpan);
-        metaBottom.appendChild(channelSpan);
-        metaBottom.appendChild(clicksSpan);
-        
-        row.appendChild(metaTop);
-        row.appendChild(body);
-        row.appendChild(metaBottom);
-        
-        logsListContainer.appendChild(row);
-      });
-    }
+    allLogs = data.logs;
+    filterAndRenderLogs();
     
     logsLoading.classList.add('hidden');
     logsListContainer.classList.remove('hidden');
   } catch (error) {
     console.error('Logs fetch failed:', error);
   }
+}
+
+// Search logs and render filtered results
+function filterAndRenderLogs() {
+  const query = logSearchInput.value.trim().toLowerCase();
+  if (!query) {
+    renderLogs(allLogs);
+    return;
+  }
+
+  const filtered = allLogs.filter(log => {
+    const username = (log.username || '').toLowerCase();
+    const userId = (log.user_id || '').toLowerCase();
+    const guildId = (log.guild_id || 'dm').toLowerCase();
+    const channelId = (log.channel_id || 'dm').toLowerCase();
+    const text = (log.message_text || '').toLowerCase();
+
+    return username.includes(query) ||
+           userId.includes(query) ||
+           guildId.includes(query) ||
+           channelId.includes(query) ||
+           text.includes(query);
+  });
+
+  renderLogs(filtered);
+}
+
+// Render dynamic log rows
+function renderLogs(logs) {
+  logsLoading.classList.add('hidden');
+  logsListContainer.classList.remove('hidden');
+  
+  logsListContainer.innerHTML = '';
+  
+  if (logs.length === 0) {
+    logsListContainer.innerHTML = '<div class="spinner-container"><span>No matching audit logs found.</span></div>';
+    return;
+  }
+  
+  logs.forEach(log => {
+    const row = document.createElement('div');
+    row.className = 'log-row';
+    
+    const metaTop = document.createElement('div');
+    metaTop.className = 'log-meta-top';
+    
+    const userSpan = document.createElement('span');
+    userSpan.className = 'log-user';
+    userSpan.innerHTML = `<i class="fa-solid fa-user-ninja" style="color: var(--accent-pink); margin-right: 6px;"></i><span style="color: var(--accent-pink); font-weight:700;">${escapeHTML(log.username || 'Unknown')}</span> (\`${log.user_id}\`)`;
+    
+    const timeSpan = document.createElement('span');
+    timeSpan.className = 'log-time';
+    timeSpan.textContent = new Date(log.initiated_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST';
+    
+    metaTop.appendChild(userSpan);
+    metaTop.appendChild(timeSpan);
+    
+    const body = document.createElement('div');
+    body.className = 'log-body';
+    body.textContent = log.message_text;
+    
+    const metaBottom = document.createElement('div');
+    metaBottom.className = 'log-meta-bottom';
+    
+    const serverSpan = document.createElement('span');
+    const serverText = log.guild_name ? `Guild: <strong>${escapeHTML(log.guild_name)}</strong>` : (log.guild_id ? `Guild ID: <code>${log.guild_id}</code>` : 'Location: <strong>DM</strong>');
+    serverSpan.innerHTML = `<i class="fa-solid fa-network-wired"></i> ${serverText}`;
+    
+    const channelSpan = document.createElement('span');
+    channelSpan.innerHTML = `<i class="fa-solid fa-hashtag"></i> Channel ID: <code>${log.channel_id || 'DM'}</code>`;
+
+    const clicksSpan = document.createElement('span');
+    const clickCount = log.click_count || 1;
+    clicksSpan.innerHTML = `<i class="fa-solid fa-arrow-pointer"></i> Clicks: <strong style="color: var(--accent-cyan);">${clickCount}</strong>`;
+    
+    metaBottom.appendChild(serverSpan);
+    metaBottom.appendChild(channelSpan);
+    metaBottom.appendChild(clicksSpan);
+    
+    row.appendChild(metaTop);
+    row.appendChild(body);
+    row.appendChild(metaBottom);
+    
+    logsListContainer.appendChild(row);
+  });
+}
+
+// Render active spam sessions
+function renderActiveQueues(queues) {
+  activeQueuesCount.textContent = `${queues.length} Active`;
+  activeQueuesList.innerHTML = '';
+
+  if (queues.length === 0) {
+    activeQueuesList.innerHTML = '<div class="empty-placeholder">No active spam sequences running.</div>';
+    return;
+  }
+
+  queues.forEach(queue => {
+    const row = document.createElement('div');
+    row.className = 'queue-row';
+
+    const details = document.createElement('div');
+    details.className = 'queue-details';
+
+    const userSpan = document.createElement('div');
+    userSpan.className = 'queue-user';
+    userSpan.innerHTML = `<i class="fa-solid fa-user-ninja" style="color: var(--accent-pink);"></i> ${escapeHTML(queue.username)} <span style="font-size:0.75rem; color:var(--text-muted); font-weight:normal;">(${queue.userId})</span>`;
+
+    const msgSpan = document.createElement('div');
+    msgSpan.className = 'queue-msg';
+    msgSpan.textContent = queue.currentMessage || 'No active message';
+
+    const badgeContainer = document.createElement('div');
+    badgeContainer.className = 'queue-badge-container';
+
+    const badge = document.createElement('span');
+    badge.className = `queue-badge ${queue.sending ? 'sending' : 'pending'}`;
+    badge.textContent = queue.sending ? 'Sending' : 'Queued';
+
+    const lenBadge = document.createElement('span');
+    lenBadge.className = 'badge';
+    lenBadge.textContent = `${queue.queueLength} remaining`;
+
+    badgeContainer.appendChild(badge);
+    badgeContainer.appendChild(lenBadge);
+
+    details.appendChild(userSpan);
+    details.appendChild(msgSpan);
+    details.appendChild(badgeContainer);
+    row.appendChild(details);
+
+    // Actions
+    const actions = document.createElement('div');
+    actions.className = 'queue-actions';
+
+    const stopBtn = document.createElement('button');
+    stopBtn.className = 'btn-queue btn-queue-stop';
+    stopBtn.innerHTML = '<i class="fa-solid fa-hand"></i> Stop';
+    stopBtn.onclick = () => handleStopQueue(queue.userId);
+
+    const purgeBtn = document.createElement('button');
+    purgeBtn.className = 'btn-queue btn-queue-purge';
+    purgeBtn.innerHTML = '<i class="fa-solid fa-trash-can"></i> Purge';
+    purgeBtn.onclick = () => handlePurgeQueue(queue.userId);
+
+    actions.appendChild(stopBtn);
+    actions.appendChild(purgeBtn);
+    row.appendChild(actions);
+
+    activeQueuesList.appendChild(row);
+  });
+}
+
+// Chart.js Initializer & Theme Customization
+function initCharts() {
+  const chartFontFamily = "'Outfit', sans-serif";
+  const textMuted = '#9ca3af';
+  const gridLineColor = 'rgba(255, 255, 255, 0.05)';
+
+  // 1. Trend Chart
+  const trendCtx = document.getElementById('trend-chart').getContext('2d');
+  
+  const trendGradient = trendCtx.createLinearGradient(0, 0, 0, 200);
+  trendGradient.addColorStop(0, 'rgba(0, 242, 254, 0.35)');
+  trendGradient.addColorStop(1, 'rgba(0, 242, 254, 0)');
+
+  trendChart = new Chart(trendCtx, {
+    type: 'line',
+    data: {
+      labels: Array.from({ length: 24 }, (_, i) => `${String(i).padStart(2, '0')}:00`),
+      datasets: [{
+        label: 'Spam Messages',
+        data: Array(24).fill(0),
+        borderColor: '#00f2fe',
+        borderWidth: 2,
+        backgroundColor: trendGradient,
+        fill: true,
+        tension: 0.35,
+        pointBackgroundColor: '#00f2fe',
+        pointBorderColor: '#ffffff',
+        pointHoverRadius: 6
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: 'rgba(13, 18, 43, 0.9)',
+          titleFont: { family: chartFontFamily, weight: 'bold', size: 12 },
+          bodyFont: { family: chartFontFamily, size: 12 },
+          borderColor: 'rgba(255, 255, 255, 0.1)',
+          borderWidth: 1,
+          padding: 10,
+          displayColors: false
+        }
+      },
+      scales: {
+        x: {
+          grid: { color: gridLineColor },
+          ticks: { color: textMuted, font: { family: chartFontFamily, size: 9 } }
+        },
+        y: {
+          grid: { color: gridLineColor },
+          ticks: { color: textMuted, font: { family: chartFontFamily, size: 9 }, precision: 0 },
+          min: 0
+        }
+      }
+    }
+  });
+
+  // 2. Channels Chart
+  const channelsCtx = document.getElementById('channels-chart').getContext('2d');
+  channelsChart = new Chart(channelsCtx, {
+    type: 'doughnut',
+    data: {
+      labels: [],
+      datasets: [{
+        data: [],
+        backgroundColor: [
+          '#ec4899', // pink
+          '#8b5cf6', // violet
+          '#00f2fe', // cyan
+          '#f59e0b', // yellow
+          '#10b981'  // green
+        ],
+        borderWidth: 1,
+        borderColor: 'rgba(255, 255, 255, 0.08)'
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          position: 'right',
+          labels: {
+            color: textMuted,
+            font: { family: chartFontFamily, size: 9 },
+            boxWidth: 10
+          }
+        },
+        tooltip: {
+          backgroundColor: 'rgba(13, 18, 43, 0.9)',
+          titleFont: { family: chartFontFamily, weight: 'bold', size: 12 },
+          bodyFont: { family: chartFontFamily, size: 12 },
+          borderColor: 'rgba(255, 255, 255, 0.1)',
+          borderWidth: 1,
+          padding: 10
+        }
+      },
+      cutout: '65%'
+    }
+  });
+
+  // 3. Users Chart
+  const usersCtx = document.getElementById('users-chart').getContext('2d');
+  usersChart = new Chart(usersCtx, {
+    type: 'bar',
+    data: {
+      labels: [],
+      datasets: [{
+        label: 'Spam Triggers',
+        data: [],
+        backgroundColor: 'rgba(139, 92, 246, 0.75)',
+        borderColor: '#8b5cf6',
+        borderWidth: 1,
+        borderRadius: 4
+      }]
+    },
+    options: {
+      indexAxis: 'y',
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: 'rgba(13, 18, 43, 0.9)',
+          titleFont: { family: chartFontFamily, weight: 'bold', size: 12 },
+          bodyFont: { family: chartFontFamily, size: 12 },
+          borderColor: 'rgba(255, 255, 255, 0.1)',
+          borderWidth: 1,
+          padding: 10,
+          displayColors: false
+        }
+      },
+      scales: {
+        x: {
+          grid: { color: gridLineColor },
+          ticks: { color: textMuted, font: { family: chartFontFamily, size: 9 }, precision: 0 },
+          min: 0
+        },
+        y: {
+          grid: { display: false },
+          ticks: { color: textMuted, font: { family: chartFontFamily, size: 9 } }
+        }
+      }
+    }
+  });
+}
+
+// Redraw chart elements smoothly with transitions
+function updateCharts(data) {
+  if (!trendChart || !channelsChart || !usersChart) {
+    initCharts();
+  }
+
+  // 1. Update Trend
+  if (data.trend && data.trend.length > 0) {
+    trendChart.data.labels = data.trend.map(d => d.label);
+    trendChart.data.datasets[0].data = data.trend.map(d => d.count);
+    trendChart.update();
+  }
+
+  // 2. Update Channels
+  if (data.channels) {
+    channelsChart.data.labels = data.channels.map(d => d.label);
+    channelsChart.data.datasets[0].data = data.channels.map(d => d.count);
+    channelsChart.update();
+  }
+
+  // 3. Update Users
+  if (data.users) {
+    usersChart.data.labels = data.users.map(d => d.label);
+    usersChart.data.datasets[0].data = data.users.map(d => d.count);
+    usersChart.update();
+  }
+}
+
+// Destroy charts on de-auth or logout to prevent Canvas recycling errors
+function destroyCharts() {
+  if (trendChart) { trendChart.destroy(); trendChart = null; }
+  if (channelsChart) { channelsChart.destroy(); channelsChart = null; }
+  if (usersChart) { usersChart.destroy(); usersChart = null; }
 }
 
 // User Actions
@@ -312,7 +666,6 @@ async function handleAuthorizeUser(e) {
     showFeedback(data.message, true);
     newUserIdInput.value = '';
     loadUsers();
-    loadStatus();
   } catch (err) {
     showFeedback(err.message, false);
   }
@@ -331,7 +684,33 @@ async function handleDeauthorizeUser(userId) {
     
     showFeedback(data.message, true);
     loadUsers();
-    loadStatus();
+  } catch (err) {
+    showFeedback(err.message, false);
+  }
+}
+
+async function handleStopQueue(userId) {
+  try {
+    const data = await fetchAPI('/api/active-queues/stop', {
+      method: 'POST',
+      body: JSON.stringify({ userId })
+    });
+    showFeedback(data.message, true);
+  } catch (err) {
+    showFeedback(err.message, false);
+  }
+}
+
+async function handlePurgeQueue(userId) {
+  if (!confirm(`Are you sure you want to stop and delete all sent messages for user ${userId}?`)) {
+    return;
+  }
+  try {
+    const data = await fetchAPI('/api/active-queues/purge', {
+      method: 'POST',
+      body: JSON.stringify({ userId })
+    });
+    showFeedback(data.message, true);
   } catch (err) {
     showFeedback(err.message, false);
   }

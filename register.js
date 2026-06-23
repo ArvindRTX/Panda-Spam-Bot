@@ -60,8 +60,22 @@ const commands = [
         description: 'Send spammed messages as Rich Embed cards (default: false)',
         type: 5, // Boolean type
         required: false
+      },
+      {
+        name: 'self_destruct',
+        description: 'Auto-delete sent messages after specified seconds (1s - 3600s, optional)',
+        type: 4, // Integer type
+        required: false,
+        min_value: 1,
+        max_value: 3600
       }
     ]
+  },
+  {
+    name: 'customspam',
+    description: 'Opens a modal to build a custom embed spam session',
+    integration_types: [1],
+    contexts: [0, 1, 2]
   },
   {
     name: 'stop',

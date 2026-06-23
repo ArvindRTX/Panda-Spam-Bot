@@ -5,7 +5,11 @@ import {
   ButtonBuilder, 
   ButtonStyle,
   Events,
-  MessageFlags
+  MessageFlags,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  InteractionType
 } from 'discord.js';
 import 'dotenv/config';
 import express from 'express';
@@ -59,6 +63,7 @@ async function initDb() {
     `);
     try {
       await pool.query('ALTER TABLE spam_logs ADD COLUMN IF NOT EXISTS click_count INTEGER DEFAULT 1');
+      await pool.query('ALTER TABLE spam_logs ADD COLUMN IF NOT EXISTS guild_name VARCHAR(100)');
       await pool.query('ALTER TABLE spam_logs ALTER COLUMN initiated_at TYPE TIMESTAMPTZ USING initiated_at AT TIME ZONE \'UTC\'');
     } catch (alterErr) {
       console.warn('[Database] Alter spam_logs warning:', alterErr.message);
@@ -71,12 +76,20 @@ async function initDb() {
         delay_ms INTEGER DEFAULT 100,
         use_tts BOOLEAN DEFAULT FALSE,
         use_embed BOOLEAN DEFAULT FALSE,
+        self_destruct_seconds INTEGER DEFAULT 0,
+        embed_title VARCHAR(200) NULL,
+        embed_image_url VARCHAR(500) NULL,
+        embed_color VARCHAR(10) NULL,
         created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
       );
     `);
     try {
       await pool.query('ALTER TABLE spam_sessions ALTER COLUMN delay_ms SET DEFAULT 100');
       await pool.query('ALTER TABLE spam_sessions ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at AT TIME ZONE \'UTC\'');
+      await pool.query('ALTER TABLE spam_sessions ADD COLUMN IF NOT EXISTS self_destruct_seconds INTEGER DEFAULT 0');
+      await pool.query('ALTER TABLE spam_sessions ADD COLUMN IF NOT EXISTS embed_title VARCHAR(200) NULL');
+      await pool.query('ALTER TABLE spam_sessions ADD COLUMN IF NOT EXISTS embed_image_url VARCHAR(500) NULL');
+      await pool.query('ALTER TABLE spam_sessions ADD COLUMN IF NOT EXISTS embed_color VARCHAR(10) NULL');
     } catch (alterErr) {
       console.warn('[Database] Alter spam_sessions warning:', alterErr.message);
     }
@@ -139,33 +152,13 @@ app.post('/api/verify-auth', (req, res) => {
 // System Status endpoint
 app.get('/api/status', requireAuth, async (req, res) => {
   try {
-    const discordLatency = client.ws.ping;
-    const guildCount = client.guilds.cache.size;
-    
-    let totalLogs = 0;
-    let authorizedCount = authorizedUsers.length;
-
-    if (databaseUrl) {
-      const logsRes = await pool.query('SELECT COUNT(*) FROM spam_logs');
-      totalLogs = parseInt(logsRes.rows[0].count, 10);
-
-      const usersRes = await pool.query('SELECT COUNT(*) FROM authorized_users');
-      authorizedCount = parseInt(usersRes.rows[0].count, 10);
-    }
-
-    res.json({
-      status: client.isReady() ? 'Online' : 'Offline',
-      uptime: Math.round(process.uptime()),
-      latency: discordLatency >= 0 ? discordLatency : 0,
-      guilds: guildCount,
-      totalLogs,
-      authorizedCount,
-      ownerId
-    });
+    const status = await getSystemStatus();
+    res.json(status);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // Authorized Users retrieval endpoint
 app.get('/api/users', requireAuth, async (req, res) => {
@@ -234,6 +227,7 @@ app.post('/api/users/authorize', requireAuth, async (req, res) => {
       'INSERT INTO authorized_users (user_id, username, added_by) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username',
       [userId, username, 'Web Dashboard']
     );
+    broadcastStats();
     res.json({ success: true, message: `Successfully authorized user ${username} (${userId})` });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -258,6 +252,7 @@ app.post('/api/users/deauthorize', requireAuth, async (req, res) => {
 
     const result = await pool.query('DELETE FROM authorized_users WHERE user_id = $1', [userId]);
     if (result.rowCount > 0) {
+      broadcastStats();
       res.json({ success: true, message: `Successfully deauthorized user ${userId}` });
     } else {
       res.status(404).json({ error: 'User was not authorized.' });
@@ -270,22 +265,140 @@ app.post('/api/users/deauthorize', requireAuth, async (req, res) => {
 // Spam Logs retrieval endpoint
 app.get('/api/logs', requireAuth, async (req, res) => {
   try {
-    if (databaseUrl) {
-      const logsRes = await pool.query(
-        'SELECT user_id, username, guild_id, channel_id, message_text, click_count, initiated_at FROM spam_logs ORDER BY initiated_at DESC LIMIT 50'
-      );
-      res.json({ logs: logsRes.rows });
-    } else {
-      res.json({ logs: [], message: 'Database is not configured. Logs are unavailable.' });
-    }
+    const logs = await getRecentLogs();
+    res.json({ logs });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// SSE Events endpoint
+app.get('/api/events', (req, res) => {
+  const token = req.query.token;
+  if (token !== adminPassword) {
+    return res.status(401).end();
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive'
+  });
+
+  const clientId = Date.now();
+  const newClient = { id: clientId, res };
+  sseClients.push(newClient);
+
+  // Send initial data immediately to the newly connected client
+  Promise.resolve().then(async () => {
+    try {
+      const stats = await getSystemStatus();
+      res.write(`event: stats\ndata: ${JSON.stringify(stats)}\n\n`);
+
+      const logs = await getRecentLogs();
+      res.write(`event: logs\ndata: ${JSON.stringify(logs)}\n\n`);
+
+      const queues = getActiveQueues();
+      res.write(`event: queues\ndata: ${JSON.stringify(queues)}\n\n`);
+
+      const analytics = await getAnalyticsData();
+      res.write(`event: analytics\ndata: ${JSON.stringify(analytics)}\n\n`);
+    } catch (err) {
+      console.error('[SSE] Error sending initial data:', err.message);
+    }
+  });
+
+  req.on('close', () => {
+    const index = sseClients.findIndex(c => c.id === clientId);
+    if (index !== -1) {
+      sseClients.splice(index, 1);
+    }
+  });
+});
+
+// GET Analytics endpoint
+app.get('/api/analytics', requireAuth, async (req, res) => {
+  try {
+    const data = await getAnalyticsData();
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// GET Active Queues endpoint
+app.get('/api/active-queues', requireAuth, (req, res) => {
+  res.json({ queues: getActiveQueues() });
+});
+
+// POST Stop User Queue endpoint
+app.post('/api/active-queues/stop', requireAuth, (req, res) => {
+  const { userId } = req.body;
+  if (!userId) {
+    return res.status(400).json({ error: 'Missing userId' });
+  }
+  const userData = userSpams.get(userId);
+  if (userData && (userData.queue.length > 0 || userData.sending)) {
+    userData.queue = [];
+    broadcastQueues();
+    res.json({ success: true, message: `Stopped active spam sequence for user ${userId}` });
+  } else {
+    res.status(404).json({ error: 'No active spam sequence found for this user' });
+  }
+});
+
+// POST Purge User Queue endpoint
+app.post('/api/active-queues/purge', requireAuth, async (req, res) => {
+  const { userId } = req.body;
+  if (!userId) {
+    return res.status(400).json({ error: 'Missing userId' });
+  }
+  
+  const userData = userSpams.get(userId);
+  if (userData) {
+    userData.queue = [];
+    broadcastQueues();
+    while (userData.sending) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+  }
+
+  if (userData && userData.messages.length > 0) {
+    const messagesToDelete = [...userData.messages];
+    userData.messages = [];
+    broadcastQueues();
+
+    Promise.all(messagesToDelete.map(async (item) => {
+      try {
+        await item.webhook.deleteMessage(item.id);
+        return true;
+      } catch (webhookError) {
+        try {
+          const channel = await client.channels.fetch(item.channelId);
+          const fetchedMsg = await channel.messages.fetch(item.id);
+          await fetchedMsg.delete();
+          return true;
+        } catch (deleteError) {
+          console.error(`[Purge Error] Failed to delete message ${item.id}:`, deleteError.message);
+          return false;
+        }
+      }
+    })).then(results => {
+      const deletedCount = results.filter(Boolean).length;
+      console.log(`[Purge] Cleaned up ${deletedCount} messages for user ${userId}`);
+    });
+
+    res.json({ success: true, message: `Purged active queue and ${messagesToDelete.length} messages for user ${userId}` });
+  } else {
+    res.status(404).json({ error: 'No messages found to delete for this user.' });
   }
 });
 
 app.listen(port, () => {
   console.log(`Dummy HTTP server listening on port ${port}`);
 });
+
 
 // Create a new client instance
 const client = new Client({
@@ -296,6 +409,208 @@ const client = new Client({
 const userSpams = new Map();
 const localSpamSessions = new Map();
 
+const sseClients = [];
+
+async function getSystemStatus() {
+  const discordLatency = client.ws.ping;
+  const guildCount = client.isReady() ? client.guilds.cache.size : 0;
+  
+  let totalLogs = 0;
+  let authorizedCount = authorizedUsers.length;
+
+  if (databaseUrl) {
+    const logsRes = await pool.query('SELECT COUNT(*) FROM spam_logs');
+    totalLogs = parseInt(logsRes.rows[0].count, 10);
+
+    const usersRes = await pool.query('SELECT COUNT(*) FROM authorized_users');
+    authorizedCount = parseInt(usersRes.rows[0].count, 10);
+  }
+
+  return {
+    status: client.isReady() ? 'Online' : 'Offline',
+    uptime: Math.round(process.uptime()),
+    latency: discordLatency >= 0 ? discordLatency : 0,
+    guilds: guildCount,
+    totalLogs,
+    authorizedCount,
+    ownerId
+  };
+}
+
+async function getRecentLogs() {
+  if (databaseUrl) {
+    const logsRes = await pool.query(
+      'SELECT user_id, username, guild_id, guild_name, channel_id, message_text, click_count, initiated_at FROM spam_logs ORDER BY initiated_at DESC LIMIT 50'
+    );
+    return logsRes.rows.map(row => {
+      const cachedGuild = (row.guild_id && client.guilds && client.guilds.cache) ? client.guilds.cache.get(row.guild_id) : null;
+      return {
+        ...row,
+        guild_name: row.guild_name || (cachedGuild ? cachedGuild.name : null)
+      };
+    });
+  }
+  return [];
+}
+
+function getActiveQueues() {
+  const queues = [];
+  userSpams.forEach((userData, userId) => {
+    if (userData.queue.length > 0 || userData.sending) {
+      queues.push({
+        userId,
+        username: userData.username || 'Unknown',
+        queueLength: userData.queue.length,
+        sending: userData.sending,
+        currentMessage: userData.currentMessage || ''
+      });
+    }
+  });
+  return queues;
+}
+
+function broadcastSSE(event, data) {
+  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  sseClients.forEach(client => {
+    try {
+      client.res.write(payload);
+    } catch (err) {
+      console.error('[SSE] Error writing to client:', err.message);
+    }
+  });
+}
+
+async function broadcastStats() {
+  try {
+    const stats = await getSystemStatus();
+    broadcastSSE('stats', stats);
+  } catch (err) {
+    console.error('[SSE] Failed to broadcast stats:', err.message);
+  }
+}
+
+async function broadcastLogs() {
+  try {
+    const logs = await getRecentLogs();
+    broadcastSSE('logs', logs);
+  } catch (err) {
+    console.error('[SSE] Failed to broadcast logs:', err.message);
+  }
+}
+
+function broadcastQueues() {
+  try {
+    const queues = getActiveQueues();
+    broadcastSSE('queues', queues);
+  } catch (err) {
+    console.error('[SSE] Failed to broadcast queues:', err.message);
+  }
+}
+
+async function getAnalyticsData() {
+  if (!databaseUrl) {
+    return {
+      trend: Array.from({ length: 24 }, (_, i) => ({
+        label: `${String(i).padStart(2, '0')}:00`,
+        count: 0
+      })),
+      channels: [],
+      users: []
+    };
+  }
+
+  try {
+    // 1. Hourly Trend (Asia/Kolkata timezone conversion)
+    const trendRes = await pool.query(`
+      SELECT 
+        to_char(h, 'HH24:00') as label,
+        COALESCE(SUM(s.click_count), 0)::integer as count
+      FROM generate_series(
+        date_trunc('hour', NOW() AT TIME ZONE 'Asia/Kolkata' - INTERVAL '23 hours'),
+        date_trunc('hour', NOW() AT TIME ZONE 'Asia/Kolkata'),
+        '1 hour'::interval
+      ) h
+      LEFT JOIN spam_logs s ON date_trunc('hour', s.initiated_at AT TIME ZONE 'Asia/Kolkata') = h
+      GROUP BY h
+      ORDER BY h ASC;
+    `);
+
+    // 2. Top Channels
+    const channelsRes = await pool.query(`
+      SELECT 
+        channel_id,
+        guild_id,
+        COALESCE(SUM(click_count), 0)::integer as count
+      FROM spam_logs 
+      GROUP BY channel_id, guild_id 
+      ORDER BY count DESC 
+      LIMIT 5;
+    `);
+
+    const channels = channelsRes.rows.map(row => {
+      let label = 'DM';
+      if (row.channel_id) {
+        const cachedChannel = (client.channels && client.channels.cache) ? client.channels.cache.get(row.channel_id) : null;
+        if (cachedChannel) {
+          const guildName = cachedChannel.guild?.name;
+          label = guildName ? `#${cachedChannel.name} (${guildName})` : `#${cachedChannel.name}`;
+        } else {
+          const cachedGuild = (row.guild_id && client.guilds && client.guilds.cache) ? client.guilds.cache.get(row.guild_id) : null;
+          label = cachedGuild ? `#${row.channel_id} (${cachedGuild.name})` : `#${row.channel_id}`;
+        }
+      }
+      return {
+        label,
+        count: row.count
+      };
+    });
+
+    // 3. Top Users
+    const usersRes = await pool.query(`
+      SELECT 
+        user_id,
+        username,
+        COALESCE(SUM(click_count), 0)::integer as count
+      FROM spam_logs 
+      GROUP BY username, user_id 
+      ORDER BY count DESC 
+      LIMIT 5;
+    `);
+
+    const users = usersRes.rows.map(row => {
+      let label = row.username;
+      if (!label) {
+        const cachedUser = (row.user_id && client.users && client.users.cache) ? client.users.cache.get(row.user_id) : null;
+        label = cachedUser ? (cachedUser.tag || cachedUser.username) : row.user_id;
+      }
+      return {
+        label,
+        count: row.count
+      };
+    });
+
+    return {
+      trend: trendRes.rows,
+      channels,
+      users
+    };
+  } catch (err) {
+    console.error('[Analytics Error] Failed to aggregate analytics:', err.message);
+    return { trend: [], channels: [], users: [] };
+  }
+}
+
+async function broadcastAnalytics() {
+  try {
+    const data = await getAnalyticsData();
+    broadcastSSE('analytics', data);
+  } catch (err) {
+    console.error('[SSE] Failed to broadcast analytics:', err.message);
+  }
+}
+
+
+
 // Helper to process a user's spam queue sequentially
 async function processQueue(userId) {
   const userData = userSpams.get(userId);
@@ -304,10 +619,12 @@ async function processQueue(userId) {
   }
 
   userData.sending = true;
+  broadcastQueues();
 
   try {
     while (userData.queue.length > 0) {
       const item = userData.queue.shift();
+      broadcastQueues();
 
       try {
         const sendOptions = {
@@ -315,14 +632,28 @@ async function processQueue(userId) {
         };
 
         if (item.embed) {
-          sendOptions.embeds = [{
-            color: 0x5865F2, // Blurple
+          let hexColor = 0x5865F2; 
+          if (item.embedColor) {
+            try {
+              hexColor = parseInt(item.embedColor.replace('#', ''), 16);
+            } catch (err) {}
+          }
+          
+          const embedData = {
+            color: hexColor,
+            title: item.embedTitle || null,
             description: item.messageText,
             timestamp: new Date().toISOString(),
             footer: {
               text: 'Panda Spammer Pro 🐼'
             }
-          }];
+          };
+
+          if (item.embedImageUrl) {
+            embedData.image = { url: item.embedImageUrl };
+          }
+
+          sendOptions.embeds = [embedData];
         } else {
           sendOptions.content = item.messageText;
         }
@@ -334,6 +665,25 @@ async function processQueue(userId) {
           webhook: item.interaction.webhook
         });
         console.log(`[Spam] Sent message ${msg.id} for user ${userId}`);
+
+        // Self-Destruct timer execution (asynchronous timeout)
+        if (item.selfDestruct && item.selfDestruct > 0) {
+          setTimeout(async () => {
+            try {
+              await item.interaction.webhook.deleteMessage(msg.id);
+              console.log(`[Self-Destruct] Auto-deleted message ${msg.id}`);
+            } catch (webhookError) {
+              try {
+                const channel = await client.channels.fetch(msg.channelId);
+                const fetchedMsg = await channel.messages.fetch(msg.id);
+                await fetchedMsg.delete();
+                console.log(`[Self-Destruct] Auto-deleted message ${msg.id} via API fallback`);
+              } catch (deleteError) {
+                console.error(`[Self-Destruct Error] Failed to delete message ${msg.id}:`, deleteError.message);
+              }
+            }
+          }, item.selfDestruct * 1000);
+        }
       } catch (loopError) {
         console.error(`[Spam Queue Error] Failed to send follow-up message for user ${userId}:`, loopError.message);
       }
@@ -345,6 +695,7 @@ async function processQueue(userId) {
     }
   } finally {
     userData.sending = false;
+    broadcastQueues();
   }
 }
 
@@ -417,13 +768,14 @@ client.on('interactionCreate', async (interaction) => {
         const delay = interaction.options.getInteger('delay') ?? 100;
         const tts = interaction.options.getBoolean('tts') ?? false;
         const embed = interaction.options.getBoolean('embed') ?? false;
+        const selfDestruct = interaction.options.getInteger('self_destruct') ?? 0;
 
         const sessionId = Math.random().toString(36).slice(2) + Date.now().toString(36);
 
         if (databaseUrl) {
           await pool.query(
-            'INSERT INTO spam_sessions (session_id, message_text, spam_count, delay_ms, use_tts, use_embed) VALUES ($1, $2, $3, $4, $5, $6)',
-            [sessionId, message, count, delay, tts, embed]
+            'INSERT INTO spam_sessions (session_id, message_text, spam_count, delay_ms, use_tts, use_embed, self_destruct_seconds) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+            [sessionId, message, count, delay, tts, embed, selfDestruct]
           );
         } else {
           localSpamSessions.set(sessionId, {
@@ -431,11 +783,12 @@ client.on('interactionCreate', async (interaction) => {
             spam_count: count,
             delay_ms: delay,
             use_tts: tts,
-            use_embed: embed
+            use_embed: embed,
+            self_destruct_seconds: selfDestruct
           });
         }
 
-        const buttonLabel = `Spam 5x` + (embed ? ' (Embed)' : '') + (tts ? ' (TTS)' : '');
+        const buttonLabel = `Spam 5x` + (embed ? ' (Embed)' : '') + (tts ? ' (TTS)' : '') + (selfDestruct > 0 ? ' (💥)' : '');
         const button = new ButtonBuilder()
           .setCustomId(`spam_click:${sessionId}`)
           .setLabel(buttonLabel)
@@ -444,7 +797,7 @@ client.on('interactionCreate', async (interaction) => {
         const row = new ActionRowBuilder().addComponents(button);
 
         await interaction.reply({
-          content: `⚙️ **Spam Configured:**\n* **Quantity:** 5 messages (Fixed)\n* **Delay:** ${delay}ms\n* **TTS:** ${tts ? 'Enabled' : 'Disabled'}\n* **Format:** ${embed ? 'Rich Embed' : 'Plain Text'}\n\nClick the button below to initiate.`,
+          content: `⚙️ **Spam Configured:**\n* **Quantity:** 5 messages (Fixed)\n* **Delay:** ${delay}ms\n* **TTS:** ${tts ? 'Enabled' : 'Disabled'}\n* **Format:** ${embed ? 'Rich Embed' : 'Plain Text'}\n* **Self-Destruct:** ${selfDestruct > 0 ? `${selfDestruct} seconds` : 'Disabled'}\n\nClick the button below to initiate.`,
           components: [row],
           flags: MessageFlags.Ephemeral
         });
@@ -457,6 +810,65 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
 
+    else if (commandName === 'customspam') {
+      try {
+        const modal = new ModalBuilder()
+          .setCustomId('custom_embed_modal')
+          .setTitle('Custom Embed Spammer');
+
+        const titleInput = new TextInputBuilder()
+          .setCustomId('embed_title')
+          .setLabel('Embed Title')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('Enter the title for your embed')
+          .setRequired(true);
+
+        const descInput = new TextInputBuilder()
+          .setCustomId('embed_description')
+          .setLabel('Embed Description (Message Body)')
+          .setStyle(TextInputStyle.Paragraph)
+          .setPlaceholder('Type your main spam message here')
+          .setRequired(true);
+
+        const colorInput = new TextInputBuilder()
+          .setCustomId('embed_color')
+          .setLabel('Accent Color (Hex Code e.g. #00f2fe)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('#5865F2')
+          .setRequired(false);
+
+        const imageInput = new TextInputBuilder()
+          .setCustomId('embed_image_url')
+          .setLabel('Embed Image URL')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('https://example.com/image.png')
+          .setRequired(false);
+
+        const selfDestructInput = new TextInputBuilder()
+          .setCustomId('self_destruct')
+          .setLabel('Self-Destruct Timer (Seconds, e.g. 10)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('Leave blank to disable auto-delete')
+          .setRequired(false);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(titleInput),
+          new ActionRowBuilder().addComponents(descInput),
+          new ActionRowBuilder().addComponents(colorInput),
+          new ActionRowBuilder().addComponents(imageInput),
+          new ActionRowBuilder().addComponents(selfDestructInput)
+        );
+
+        await interaction.showModal(modal);
+      } catch (error) {
+        console.error('Error opening customspam modal:', error);
+        await interaction.reply({
+          content: '❌ Failed to open the custom embed modal.',
+          flags: MessageFlags.Ephemeral
+        }).catch(() => {});
+      }
+    }
+
     else if (commandName === 'stop') {
       try {
         const userId = interaction.user.id;
@@ -464,6 +876,7 @@ client.on('interactionCreate', async (interaction) => {
 
         if (userData && (userData.queue.length > 0 || userData.sending)) {
           userData.queue = []; // Clear the queue to stop further sends immediately
+          broadcastQueues();
           await interaction.reply({
             content: '🛑 Stopped all your active spam sequences.',
             flags: MessageFlags.Ephemeral
@@ -487,6 +900,7 @@ client.on('interactionCreate', async (interaction) => {
         // First stop any active queue for this user
         if (userData) {
           userData.queue = [];
+          broadcastQueues();
           // Wait for the active in-flight message to finish if sending is true
           while (userData.sending) {
             await new Promise(resolve => setTimeout(resolve, 50));
@@ -497,6 +911,7 @@ client.on('interactionCreate', async (interaction) => {
           // Deleting messages
           const messagesToDelete = [...userData.messages];
           userData.messages = []; // Clear local list immediately to prevent double-deletes
+          broadcastQueues();
 
           await interaction.reply({
             content: '🧹 Deleting spam messages to clean traces...',
@@ -664,13 +1079,24 @@ client.on('interactionCreate', async (interaction) => {
         const res = await pool.query('SELECT user_id, added_by, added_at FROM authorized_users ORDER BY added_at DESC');
 
         if (res.rowCount > 0) {
-          const userList = res.rows.map((row, idx) => {
+          let content = `👑 **Authorized Users List** (Database):\n**Owner:** <@${ownerId}>\n\n`;
+          let addedCount = 0;
+          for (let i = 0; i < res.rows.length; i++) {
+            const row = res.rows[i];
             const dateStr = row.added_at ? new Date(row.added_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST' : 'N/A';
-            return `${idx + 1}. <@${row.user_id}> (ID: ${row.user_id}) - Added by <@${row.added_by}> at ${dateStr}`;
-          }).join('\n');
+            const line = `${i + 1}. <@${row.user_id}> (ID: ${row.user_id}) - Added by <@${row.added_by}> at ${dateStr}\n`;
+            
+            if (content.length + line.length > 1900) {
+              const remaining = res.rowCount - addedCount;
+              content += `⚠️ *Truncated ${remaining} more users due to Discord length limits. View them all on the Web Dashboard!*`;
+              break;
+            }
+            content += line;
+            addedCount++;
+          }
 
           await interaction.reply({
-            content: `👑 **Authorized Users List** (Database):\n**Owner:** <@${ownerId}>\n\n${userList}`,
+            content: content,
             flags: MessageFlags.Ephemeral
           });
         } else {
@@ -708,21 +1134,33 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         const res = await pool.query(
-          'SELECT user_id, username, guild_id, channel_id, message_text, click_count, initiated_at FROM spam_logs ORDER BY initiated_at DESC LIMIT 15'
+          'SELECT user_id, username, guild_id, guild_name, channel_id, message_text, click_count, initiated_at FROM spam_logs ORDER BY initiated_at DESC LIMIT 15'
         );
 
         if (res.rowCount > 0) {
-          const logsList = res.rows.map((row) => {
+          let content = `📋 **Recent Spam Logs (Last 15):**\n\n`;
+          let addedCount = 0;
+          for (const row of res.rows) {
             const dateStr = row.initiated_at ? new Date(row.initiated_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST' : 'N/A';
-            const server = row.guild_id ? `Server ID: \`${row.guild_id}\`` : 'DM';
+            const cachedGuild = (row.guild_id && client.guilds && client.guilds.cache) ? client.guilds.cache.get(row.guild_id) : null;
+            const resolvedGuildName = row.guild_name || (cachedGuild ? cachedGuild.name : null);
+            const server = resolvedGuildName ? `**${resolvedGuildName}**` : (row.guild_id ? `Server ID: \`${row.guild_id}\`` : 'DM');
             const channel = row.channel_id ? `<#${row.channel_id}> (\`${row.channel_id}\`)` : 'N/A';
             const clicks = row.click_count || 1;
             const cleanText = row.message_text.replace(/`/g, '\\`').slice(0, 100);
-            return `📅 **${dateStr}** (Clicks: **${clicks}**)\n👤 **User:** <@${row.user_id}> (\`${row.username || row.user_id}\`)\n🌐 **Location:** ${server} | **Channel:** ${channel}\n💬 **Message:** \`${cleanText}\`\n`;
-          }).join('\n');
+            const line = `📅 **${dateStr}** (Clicks: **${clicks}**)\n👤 **User:** <@${row.user_id}> (\`${row.username || row.user_id}\`)\n🌐 **Location:** ${server} | **Channel:** ${channel}\n💬 **Message:** \`${cleanText}\`\n\n`;
+            
+            if (content.length + line.length > 1900) {
+              const remaining = res.rowCount - addedCount;
+              content += `⚠️ *Truncated ${remaining} more entries due to Discord length limits. View them all on the Web Dashboard!*`;
+              break;
+            }
+            content += line;
+            addedCount++;
+          }
 
           await interaction.reply({
-            content: `📋 **Recent Spam Logs (Last 15):**\n\n${logsList}`,
+            content: content,
             flags: MessageFlags.Ephemeral
           });
         } else {
@@ -759,6 +1197,9 @@ client.on('interactionCreate', async (interaction) => {
             stopCount++;
           }
         });
+        if (stopCount > 0) {
+          broadcastQueues();
+        }
 
         await interaction.reply({
           content: `🛑 Stopped active spam sequences for **${stopCount}** users.`,
@@ -789,6 +1230,7 @@ client.on('interactionCreate', async (interaction) => {
         userSpams.forEach((userData) => {
           userData.queue = [];
         });
+        broadcastQueues();
 
         // Wait for any active sends to finish
         let anySending = true;
@@ -812,6 +1254,7 @@ client.on('interactionCreate', async (interaction) => {
             userData.messages = []; // Clear local list immediately
           }
         });
+        broadcastQueues();
 
         if (allMessages.length > 0) {
           await interaction.reply({
@@ -861,6 +1304,66 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
+  // 3. Handle Modal Submissions
+  else if (interaction.type === InteractionType.ModalSubmit) {
+    const { customId } = interaction;
+
+    if (customId === 'custom_embed_modal') {
+      try {
+        const title = interaction.fields.getTextInputValue('embed_title');
+        const description = interaction.fields.getTextInputValue('embed_description');
+        const color = interaction.fields.getTextInputValue('embed_color') || '#5865F2';
+        const imageUrl = interaction.fields.getTextInputValue('embed_image_url') || '';
+        const selfDestructStr = interaction.fields.getTextInputValue('self_destruct');
+        const selfDestruct = parseInt(selfDestructStr, 10) || 0;
+
+        const count = 5; 
+        const delay = 100; 
+
+        const sessionId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+        if (databaseUrl) {
+          await pool.query(
+            'INSERT INTO spam_sessions (session_id, message_text, spam_count, delay_ms, use_tts, use_embed, self_destruct_seconds, embed_title, embed_image_url, embed_color) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)',
+            [sessionId, description, count, delay, false, true, selfDestruct, title, imageUrl, color]
+          );
+        } else {
+          localSpamSessions.set(sessionId, {
+            message_text: description,
+            spam_count: count,
+            delay_ms: delay,
+            use_tts: false,
+            use_embed: true,
+            self_destruct_seconds: selfDestruct,
+            embed_title: title,
+            embed_image_url: imageUrl,
+            embed_color: color
+          });
+        }
+
+        const buttonLabel = `Spam 5x (Embed)` + (selfDestruct > 0 ? ' (💥)' : '');
+        const button = new ButtonBuilder()
+          .setCustomId(`spam_click:${sessionId}`)
+          .setLabel(buttonLabel)
+          .setStyle(ButtonStyle.Danger);
+
+        const row = new ActionRowBuilder().addComponents(button);
+
+        await interaction.reply({
+          content: `⚙️ **Custom Embed Configured:**\n* **Title:** ${title}\n* **Accent Color:** ${color}\n* **Image:** ${imageUrl || 'None'}\n* **Self-Destruct:** ${selfDestruct > 0 ? `${selfDestruct} seconds` : 'Disabled'}\n\nClick the button below to initiate.`,
+          components: [row],
+          flags: MessageFlags.Ephemeral
+        });
+      } catch (error) {
+        console.error('Error handling custom embed modal submit:', error);
+        await interaction.reply({
+          content: '❌ An error occurred while saving your custom embed config.',
+          flags: MessageFlags.Ephemeral
+        }).catch(() => {});
+      }
+    }
+  }
+
   // 2. Handle Button Component Interactions
   else if (interaction.isButton()) {
     const { customId } = interaction;
@@ -887,7 +1390,7 @@ client.on('interactionCreate', async (interaction) => {
         if (databaseUrl) {
           try {
             const res = await pool.query(
-              'SELECT message_text, spam_count, delay_ms, use_tts, use_embed FROM spam_sessions WHERE session_id = $1',
+              'SELECT message_text, spam_count, delay_ms, use_tts, use_embed, self_destruct_seconds, embed_title, embed_image_url, embed_color FROM spam_sessions WHERE session_id = $1',
               [sessionId]
             );
             if (res.rowCount > 0) {
@@ -917,12 +1420,18 @@ client.on('interactionCreate', async (interaction) => {
         const delay = session.delay_ms || 100;
         const tts = session.use_tts || false;
         const embed = session.use_embed || false;
+        const selfDestruct = session.self_destruct_seconds || 0;
+        const embedTitle = session.embed_title || null;
+        const embedImageUrl = session.embed_image_url || null;
+        const embedColor = session.embed_color || null;
 
         // Initialize user entry if not exists
         if (!userSpams.has(userId)) {
-          userSpams.set(userId, { queue: [], sending: false, messages: [] });
+          userSpams.set(userId, { queue: [], sending: false, messages: [], username: interaction.user.tag || interaction.user.username });
         }
         const userData = userSpams.get(userId);
+        userData.username = interaction.user.tag || interaction.user.username;
+        userData.currentMessage = messageText;
 
         // Acknowledge the interaction immediately to prevent timeout silently
         await interaction.deferUpdate();
@@ -948,17 +1457,22 @@ client.on('interactionCreate', async (interaction) => {
               );
             } else {
               // No recent duplicate. Insert fresh record.
+              const guildName = interaction.guild ? interaction.guild.name : null;
               await pool.query(
-                'INSERT INTO spam_logs (user_id, username, guild_id, channel_id, message_text, click_count) VALUES ($1, $2, $3, $4, $5, 1)',
+                'INSERT INTO spam_logs (user_id, username, guild_id, guild_name, channel_id, message_text, click_count) VALUES ($1, $2, $3, $4, $5, $6, 1)',
                 [
                   userId,
                   interaction.user.tag || interaction.user.username,
                   interaction.guildId || null,
+                  guildName,
                   interaction.channelId || null,
                   messageText.slice(0, 200)
                 ]
               );
             }
+            broadcastLogs();
+            broadcastStats();
+            broadcastAnalytics();
           } catch (dbErr) {
             console.error('[Database] Failed to log spam execution:', dbErr.message);
           }
@@ -971,9 +1485,14 @@ client.on('interactionCreate', async (interaction) => {
             interaction,
             tts,
             embed,
-            delay
+            delay,
+            selfDestruct,
+            embedTitle,
+            embedImageUrl,
+            embedColor
           });
         }
+        broadcastQueues();
 
         // Start processing the queue (it will self-gate if already sending)
         processQueue(userId);
