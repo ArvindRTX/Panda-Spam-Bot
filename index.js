@@ -38,7 +38,18 @@ async function initDb() {
         added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
-    console.log('[Database] PostgreSQL table initialized successfully.');
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS spam_logs (
+        id SERIAL PRIMARY KEY,
+        user_id VARCHAR(30) NOT NULL,
+        username VARCHAR(100),
+        guild_id VARCHAR(30),
+        channel_id VARCHAR(30),
+        message_text VARCHAR(200),
+        initiated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    console.log('[Database] PostgreSQL tables initialized successfully.');
   } catch (error) {
     console.error('[Database] Failed to initialize database:', error.message);
   }
@@ -385,6 +396,107 @@ client.on('interactionCreate', async (interaction) => {
         }).catch(() => {});
       }
     }
+
+    else if (commandName === 'listauthorized') {
+      try {
+        const executorId = interaction.user.id;
+
+        // Strictly check that ONLY the owner can run this
+        if (!ownerId || executorId !== ownerId) {
+          return interaction.reply({
+            content: '❌ Only the application owner can view the authorized users.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        if (!databaseUrl) {
+          // Fall back to environment variable list
+          const fallbackList = authorizedUsers.length > 0 
+            ? authorizedUsers.map(id => `<@${id}> (${id})`).join('\n') 
+            : 'None';
+          return interaction.reply({
+            content: `ℹ️ Database not configured. Fallback authorized users from environment variable:\n**Owner:** <@${ownerId}>\n**Authorized Users:**\n${fallbackList}`,
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        const res = await pool.query('SELECT user_id, added_by, added_at FROM authorized_users ORDER BY added_at DESC');
+
+        if (res.rowCount > 0) {
+          const userList = res.rows.map((row, idx) => {
+            const dateStr = row.added_at ? new Date(row.added_at).toLocaleString() : 'N/A';
+            return `${idx + 1}. <@${row.user_id}> (ID: ${row.user_id}) - Added by <@${row.added_by}> at ${dateStr}`;
+          }).join('\n');
+
+          await interaction.reply({
+            content: `👑 **Authorized Users List** (Database):\n**Owner:** <@${ownerId}>\n\n${userList}`,
+            flags: MessageFlags.Ephemeral
+          });
+        } else {
+          await interaction.reply({
+            content: `👑 **Authorized Users List** (Database):\n**Owner:** <@${ownerId}>\n\nNo other users are currently authorized.`,
+            flags: MessageFlags.Ephemeral
+          });
+        }
+      } catch (error) {
+        console.error('Error executing /listauthorized command:', error);
+        await interaction.reply({
+          content: '❌ Database error occurred while listing authorized users.',
+          flags: MessageFlags.Ephemeral
+        }).catch(() => {});
+      }
+    }
+
+    else if (commandName === 'spamlogs') {
+      try {
+        const executorId = interaction.user.id;
+
+        // Strictly check that ONLY the owner can run this
+        if (!ownerId || executorId !== ownerId) {
+          return interaction.reply({
+            content: '❌ Only the application owner can view spam logs.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        if (!databaseUrl) {
+          return interaction.reply({
+            content: '❌ Database is not configured. Cannot retrieve spam logs.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        const res = await pool.query(
+          'SELECT user_id, username, guild_id, channel_id, message_text, initiated_at FROM spam_logs ORDER BY initiated_at DESC LIMIT 15'
+        );
+
+        if (res.rowCount > 0) {
+          const logsList = res.rows.map((row) => {
+            const dateStr = row.initiated_at ? new Date(row.initiated_at).toLocaleString() : 'N/A';
+            const server = row.guild_id ? `Server ID: \`${row.guild_id}\`` : 'DM';
+            const channel = row.channel_id ? `<#${row.channel_id}> (\`${row.channel_id}\`)` : 'N/A';
+            const cleanText = row.message_text.replace(/`/g, '\\`').slice(0, 100);
+            return `📅 **${dateStr}**\n👤 **User:** <@${row.user_id}> (\`${row.username || row.user_id}\`)\n🌐 **Location:** ${server} | **Channel:** ${channel}\n💬 **Message:** \`${cleanText}\`\n`;
+          }).join('\n');
+
+          await interaction.reply({
+            content: `📋 **Recent Spam Logs (Last 15):**\n\n${logsList}`,
+            flags: MessageFlags.Ephemeral
+          });
+        } else {
+          await interaction.reply({
+            content: 'ℹ️ No spam log entries found in the database.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+      } catch (error) {
+        console.error('Error executing /spamlogs command:', error);
+        await interaction.reply({
+          content: '❌ Database error occurred while retrieving spam logs.',
+          flags: MessageFlags.Ephemeral
+        }).catch(() => {});
+      }
+    }
   }
 
   // 2. Handle Button Component Interactions
@@ -416,6 +528,24 @@ client.on('interactionCreate', async (interaction) => {
 
         // Acknowledge the interaction immediately to prevent timeout silently
         await interaction.deferUpdate();
+
+        // Log the spam initiation if database is configured
+        if (databaseUrl) {
+          try {
+            await pool.query(
+              'INSERT INTO spam_logs (user_id, username, guild_id, channel_id, message_text) VALUES ($1, $2, $3, $4, $5)',
+              [
+                userId,
+                interaction.user.tag || interaction.user.username,
+                interaction.guildId || null,
+                interaction.channelId || null,
+                messageText.slice(0, 200)
+              ]
+            );
+          } catch (dbErr) {
+            console.error('[Database] Failed to log spam execution:', dbErr.message);
+          }
+        }
 
         // Add 5 messages to the queue
         for (let i = 0; i < 5; i++) {

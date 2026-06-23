@@ -82,6 +82,18 @@ const commands = [
         required: true
       }
     ]
+  },
+  {
+    name: 'listauthorized',
+    description: 'Lists all authorized users (Owner Only)',
+    integration_types: [1],
+    contexts: [0, 1, 2]
+  },
+  {
+    name: 'spamlogs',
+    description: 'Shows the recent spam command logs (Owner Only)',
+    integration_types: [1],
+    contexts: [0, 1, 2]
   }
 ];
 
