@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Panda Spammer Pro | Admin Dashboard 🐼</title>
+  <!-- Google Font: Outfit -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+  <!-- Background decorative glowing blobs -->
+  <div class="blob blob-1"></div>
+  <div class="blob blob-2"></div>
+  <div class="blob blob-3"></div>
+
+  <!-- Login Modal Overlay -->
+  <div id="login-overlay" class="overlay">
+    <div class="glass-card login-card">
+      <div class="logo-area">
+        <div class="panda-icon">🐼</div>
+        <h2>Panda Spammer Pro</h2>
+        <p>Admin Portal Authentication</p>
+      </div>
+      <form id="login-form">
+        <div class="input-group">
+          <i class="fa-solid fa-lock"></i>
+          <input type="password" id="admin-pass" placeholder="Enter Admin Password" required autocomplete="current-password">
+        </div>
+        <button type="submit" class="btn btn-primary">
+          <span>Login Dashboard</span>
+          <i class="fa-solid fa-arrow-right-to-bracket"></i>
+        </button>
+        <div id="login-error" class="error-msg"></div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Main Dashboard Application Wrapper -->
+  <div id="app-container" class="dashboard-wrapper hidden">
+    <!-- Header -->
+    <header class="dashboard-header glass-card">
+      <div class="brand">
+        <span class="panda-logo">🐼</span>
+        <div>
+          <h1>Panda Spammer Pro</h1>
+          <p class="tagline">User-Installable Discord App Management</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <span id="connection-status" class="status-indicator online">
+          <span class="dot"></span>
+          <span class="status-text">Connecting...</span>
+        </span>
+        <button id="logout-btn" class="btn btn-danger-outline">
+          <i class="fa-solid fa-arrow-right-from-bracket"></i>
+          <span>Logout</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Metrics Grid -->
+    <section class="metrics-grid">
+      <div class="glass-card metric-card">
+        <div class="metric-icon color-green"><i class="fa-solid fa-circle-play"></i></div>
+        <div class="metric-info">
+          <h3>Bot Status</h3>
+          <p id="bot-status" class="metric-val">Loading...</p>
+        </div>
+      </div>
+      <div class="glass-card metric-card">
+        <div class="metric-icon color-cyan"><i class="fa-solid fa-hourglass-half"></i></div>
+        <div class="metric-info">
+          <h3>Uptime</h3>
+          <p id="bot-uptime" class="metric-val">Loading...</p>
+        </div>
+      </div>
+      <div class="glass-card metric-card">
+        <div class="metric-icon color-violet"><i class="fa-solid fa-gauge-high"></i></div>
+        <div class="metric-info">
+          <h3>API Latency</h3>
+          <p id="bot-latency" class="metric-val">Loading...</p>
+        </div>
+      </div>
+      <div class="glass-card metric-card">
+        <div class="metric-icon color-yellow"><i class="fa-solid fa-server"></i></div>
+        <div class="metric-info">
+          <h3>Guilds Cached</h3>
+          <p id="bot-guilds" class="metric-val">Loading...</p>
+        </div>
+      </div>
+      <div class="glass-card metric-card">
+        <div class="metric-icon color-pink"><i class="fa-solid fa-list-check"></i></div>
+        <div class="metric-info">
+          <h3>Total Logs</h3>
+          <p id="total-logs" class="metric-val">Loading...</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Main Workspace Layout -->
+    <main class="dashboard-main">
+      
+      <!-- Left Panel: Access Management -->
+      <section class="glass-card panel-card flex-column">
+        <div class="panel-header">
+          <h2><i class="fa-solid fa-user-shield"></i> Access Control</h2>
+          <span class="badge" id="auth-users-count">0 Users</span>
+        </div>
+        
+        <!-- Add User Form -->
+        <form id="add-user-form" class="add-user-form">
+          <div class="input-group">
+            <i class="fa-solid fa-user-plus"></i>
+            <input type="text" id="new-user-id" placeholder="Enter Discord User ID" required pattern="\d{17,20}">
+          </div>
+          <button type="submit" class="btn btn-success">
+            <i class="fa-solid fa-check"></i>
+            <span>Authorize</span>
+          </button>
+        </form>
+        <div id="action-feedback" class="action-feedback"></div>
+
+        <!-- Users List -->
+        <div class="list-wrapper scrollbar">
+          <div id="users-loading" class="spinner-container">
+            <i class="fa-solid fa-spinner fa-spin"></i>
+            <span>Fetching Users...</span>
+          </div>
+          <div id="users-list-container" class="users-list hidden">
+            <!-- Dynamic Users will be injected here -->
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Panel: Spam Execution Audit Logs -->
+      <section class="glass-card panel-card flex-column">
+        <div class="panel-header">
+          <h2><i class="fa-solid fa-file-invoice"></i> Spam Audit Logs</h2>
+          <button id="refresh-logs-btn" class="btn btn-primary-outline btn-sm">
+            <i class="fa-solid fa-rotate"></i>
+            <span>Refresh</span>
+          </button>
+        </div>
+
+        <!-- Audit Logs List -->
+        <div class="list-wrapper scrollbar">
+          <div id="logs-loading" class="spinner-container">
+            <i class="fa-solid fa-spinner fa-spin"></i>
+            <span>Fetching Logs...</span>
+          </div>
+          <div id="logs-list-container" class="logs-list hidden">
+            <!-- Dynamic Logs will be injected here -->
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

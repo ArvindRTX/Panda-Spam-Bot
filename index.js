@@ -34,10 +34,17 @@ async function initDb() {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS authorized_users (
         user_id VARCHAR(30) PRIMARY KEY,
+        username VARCHAR(100),
         added_by VARCHAR(30),
-        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        added_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    try {
+      await pool.query('ALTER TABLE authorized_users ADD COLUMN IF NOT EXISTS username VARCHAR(100)');
+      await pool.query('ALTER TABLE authorized_users ALTER COLUMN added_at TYPE TIMESTAMPTZ USING added_at AT TIME ZONE \'UTC\'');
+    } catch (alterErr) {
+      console.warn('[Database] Alter authorized_users warning:', alterErr.message);
+    }
     await pool.query(`
       CREATE TABLE IF NOT EXISTS spam_logs (
         id SERIAL PRIMARY KEY,
@@ -46,9 +53,33 @@ async function initDb() {
         guild_id VARCHAR(30),
         channel_id VARCHAR(30),
         message_text VARCHAR(200),
-        initiated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        click_count INTEGER DEFAULT 1,
+        initiated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    try {
+      await pool.query('ALTER TABLE spam_logs ADD COLUMN IF NOT EXISTS click_count INTEGER DEFAULT 1');
+      await pool.query('ALTER TABLE spam_logs ALTER COLUMN initiated_at TYPE TIMESTAMPTZ USING initiated_at AT TIME ZONE \'UTC\'');
+    } catch (alterErr) {
+      console.warn('[Database] Alter spam_logs warning:', alterErr.message);
+    }
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS spam_sessions (
+        session_id VARCHAR(50) PRIMARY KEY,
+        message_text TEXT NOT NULL,
+        spam_count INTEGER DEFAULT 5,
+        delay_ms INTEGER DEFAULT 100,
+        use_tts BOOLEAN DEFAULT FALSE,
+        use_embed BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    try {
+      await pool.query('ALTER TABLE spam_sessions ALTER COLUMN delay_ms SET DEFAULT 100');
+      await pool.query('ALTER TABLE spam_sessions ALTER COLUMN created_at TYPE TIMESTAMPTZ USING created_at AT TIME ZONE \'UTC\'');
+    } catch (alterErr) {
+      console.warn('[Database] Alter spam_sessions warning:', alterErr.message);
+    }
     console.log('[Database] PostgreSQL tables initialized successfully.');
   } catch (error) {
     console.error('[Database] Failed to initialize database:', error.message);
@@ -76,12 +107,180 @@ if (!token || token === 'your_bot_token_here') {
   process.exit(1);
 }
 
-// Start a dummy Express HTTP server to bind to a port for Render Free Web Service
+// Start an Express HTTP server with dashboard routing and JSON parsing
 const app = express();
 const port = process.env.PORT || 3000;
+const adminPassword = process.env.ADMIN_PASSWORD || 'admin';
 
-app.get('/', (req, res) => {
-  res.send('Panda AWM Bot is running!');
+app.use(express.json());
+app.use(express.static('public'));
+
+// Password authorization middleware
+function requireAuth(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (token === adminPassword) {
+    next();
+  } else {
+    res.status(401).json({ error: 'Unauthorized' });
+  }
+}
+
+// Authentication verification endpoint
+app.post('/api/verify-auth', (req, res) => {
+  const { password } = req.body;
+  if (password === adminPassword) {
+    res.json({ success: true });
+  } else {
+    res.status(401).json({ error: 'Invalid password' });
+  }
+});
+
+// System Status endpoint
+app.get('/api/status', requireAuth, async (req, res) => {
+  try {
+    const discordLatency = client.ws.ping;
+    const guildCount = client.guilds.cache.size;
+    
+    let totalLogs = 0;
+    let authorizedCount = authorizedUsers.length;
+
+    if (databaseUrl) {
+      const logsRes = await pool.query('SELECT COUNT(*) FROM spam_logs');
+      totalLogs = parseInt(logsRes.rows[0].count, 10);
+
+      const usersRes = await pool.query('SELECT COUNT(*) FROM authorized_users');
+      authorizedCount = parseInt(usersRes.rows[0].count, 10);
+    }
+
+    res.json({
+      status: client.isReady() ? 'Online' : 'Offline',
+      uptime: Math.round(process.uptime()),
+      latency: discordLatency >= 0 ? discordLatency : 0,
+      guilds: guildCount,
+      totalLogs,
+      authorizedCount,
+      ownerId
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Authorized Users retrieval endpoint
+app.get('/api/users', requireAuth, async (req, res) => {
+  try {
+    let users = [];
+    let source = 'env';
+
+    if (databaseUrl) {
+      const usersRes = await pool.query('SELECT user_id, username, added_by, added_at FROM authorized_users ORDER BY added_at DESC');
+      users = usersRes.rows;
+      source = 'database';
+    } else {
+      users = authorizedUsers.map(id => ({
+        user_id: id,
+        username: null,
+        added_by: 'Environment Fallback',
+        added_at: new Date()
+      }));
+    }
+
+    // Self-healing: Resolve missing usernames dynamically via Discord Client
+    for (let user of users) {
+      if (!user.username) {
+        try {
+          const discordUser = await client.users.fetch(user.user_id);
+          user.username = discordUser.tag || discordUser.username;
+          
+          if (source === 'database') {
+            pool.query('UPDATE authorized_users SET username = $1 WHERE user_id = $2', [user.username, user.user_id]).catch(dbErr => {
+              console.error(`[Database] Failed to backfill username for ${user.user_id}:`, dbErr.message);
+            });
+          }
+        } catch (fetchErr) {
+          console.warn(`[API] Could not resolve username for user ID ${user.user_id}:`, fetchErr.message);
+        }
+      }
+    }
+
+    res.json({ users, source });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Authorize User endpoint
+app.post('/api/users/authorize', requireAuth, async (req, res) => {
+  const { userId } = req.body;
+  if (!userId || typeof userId !== 'string' || !/^\d{17,20}$/.test(userId)) {
+    return res.status(400).json({ error: 'Invalid User ID format (must be 17-20 digits)' });
+  }
+
+  try {
+    if (!databaseUrl) {
+      return res.status(400).json({ error: 'Database is not configured. Cannot add authorized users dynamically.' });
+    }
+
+    let username = 'Unknown';
+    try {
+      const user = await client.users.fetch(userId);
+      username = user.tag || user.username;
+    } catch (fetchErr) {
+      console.warn(`[Web Dashboard] Could not fetch username for ID ${userId}:`, fetchErr.message);
+    }
+
+    await pool.query(
+      'INSERT INTO authorized_users (user_id, username, added_by) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username',
+      [userId, username, 'Web Dashboard']
+    );
+    res.json({ success: true, message: `Successfully authorized user ${username} (${userId})` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Deauthorize User endpoint
+app.post('/api/users/deauthorize', requireAuth, async (req, res) => {
+  const { userId } = req.body;
+  if (!userId || typeof userId !== 'string') {
+    return res.status(400).json({ error: 'Invalid User ID' });
+  }
+
+  if (userId === ownerId) {
+    return res.status(400).json({ error: 'Cannot deauthorize the application owner.' });
+  }
+
+  try {
+    if (!databaseUrl) {
+      return res.status(400).json({ error: 'Database is not configured. Cannot remove authorized users dynamically.' });
+    }
+
+    const result = await pool.query('DELETE FROM authorized_users WHERE user_id = $1', [userId]);
+    if (result.rowCount > 0) {
+      res.json({ success: true, message: `Successfully deauthorized user ${userId}` });
+    } else {
+      res.status(404).json({ error: 'User was not authorized.' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Spam Logs retrieval endpoint
+app.get('/api/logs', requireAuth, async (req, res) => {
+  try {
+    if (databaseUrl) {
+      const logsRes = await pool.query(
+        'SELECT user_id, username, guild_id, channel_id, message_text, click_count, initiated_at FROM spam_logs ORDER BY initiated_at DESC LIMIT 50'
+      );
+      res.json({ logs: logsRes.rows });
+    } else {
+      res.json({ logs: [], message: 'Database is not configured. Logs are unavailable.' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.listen(port, () => {
@@ -95,6 +294,7 @@ const client = new Client({
 
 // Track active spam queues and sent messages per user
 const userSpams = new Map();
+const localSpamSessions = new Map();
 
 // Helper to process a user's spam queue sequentially
 async function processQueue(userId) {
@@ -110,9 +310,24 @@ async function processQueue(userId) {
       const item = userData.queue.shift();
 
       try {
-        const msg = await item.interaction.followUp({
-          content: item.messageText
-        });
+        const sendOptions = {
+          tts: item.tts || false
+        };
+
+        if (item.embed) {
+          sendOptions.embeds = [{
+            color: 0x5865F2, // Blurple
+            description: item.messageText,
+            timestamp: new Date().toISOString(),
+            footer: {
+              text: 'Panda Spammer Pro 🐼'
+            }
+          }];
+        } else {
+          sendOptions.content = item.messageText;
+        }
+
+        const msg = await item.interaction.followUp(sendOptions);
         userData.messages.push({
           id: msg.id,
           channelId: msg.channelId,
@@ -123,9 +338,9 @@ async function processQueue(userId) {
         console.error(`[Spam Queue Error] Failed to send follow-up message for user ${userId}:`, loopError.message);
       }
 
-      // Add a small delay between messages to preserve order and avoid rate limits
+      // Add a custom delay between messages to preserve order and avoid rate limits
       if (userData.queue.length > 0) {
-        await new Promise(resolve => setTimeout(resolve, 250));
+        await new Promise(resolve => setTimeout(resolve, item.delay || 100));
       }
     }
   } finally {
@@ -198,21 +413,47 @@ client.on('interactionCreate', async (interaction) => {
     else if (commandName === 'spam') {
       try {
         const message = interaction.options.getString('message');
+        const count = 5; // Fixed to 5x spam
+        const delay = interaction.options.getInteger('delay') ?? 100;
+        const tts = interaction.options.getBoolean('tts') ?? false;
+        const embed = interaction.options.getBoolean('embed') ?? false;
+
+        const sessionId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+        if (databaseUrl) {
+          await pool.query(
+            'INSERT INTO spam_sessions (session_id, message_text, spam_count, delay_ms, use_tts, use_embed) VALUES ($1, $2, $3, $4, $5, $6)',
+            [sessionId, message, count, delay, tts, embed]
+          );
+        } else {
+          localSpamSessions.set(sessionId, {
+            message_text: message,
+            spam_count: count,
+            delay_ms: delay,
+            use_tts: tts,
+            use_embed: embed
+          });
+        }
+
+        const buttonLabel = `Spam 5x` + (embed ? ' (Embed)' : '') + (tts ? ' (TTS)' : '');
         const button = new ButtonBuilder()
-          .setCustomId(`spam_click:${message}`)
-          .setLabel('Click Me 5x')
+          .setCustomId(`spam_click:${sessionId}`)
+          .setLabel(buttonLabel)
           .setStyle(ButtonStyle.Danger);
 
         const row = new ActionRowBuilder().addComponents(button);
 
-        // Reply with an ephemeral message containing the "Click Me 5x" button
         await interaction.reply({
-          content: 'Here is your 5x spam button:',
+          content: `⚙️ **Spam Configured:**\n* **Quantity:** 5 messages (Fixed)\n* **Delay:** ${delay}ms\n* **TTS:** ${tts ? 'Enabled' : 'Disabled'}\n* **Format:** ${embed ? 'Rich Embed' : 'Plain Text'}\n\nClick the button below to initiate.`,
           components: [row],
           flags: MessageFlags.Ephemeral
         });
       } catch (error) {
         console.error('Error executing /spam command:', error);
+        await interaction.reply({
+          content: '❌ An error occurred while setting up the spam session.',
+          flags: MessageFlags.Ephemeral
+        }).catch(() => {});
       }
     }
 
@@ -424,7 +665,7 @@ client.on('interactionCreate', async (interaction) => {
 
         if (res.rowCount > 0) {
           const userList = res.rows.map((row, idx) => {
-            const dateStr = row.added_at ? new Date(row.added_at).toLocaleString() : 'N/A';
+            const dateStr = row.added_at ? new Date(row.added_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST' : 'N/A';
             return `${idx + 1}. <@${row.user_id}> (ID: ${row.user_id}) - Added by <@${row.added_by}> at ${dateStr}`;
           }).join('\n');
 
@@ -467,16 +708,17 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         const res = await pool.query(
-          'SELECT user_id, username, guild_id, channel_id, message_text, initiated_at FROM spam_logs ORDER BY initiated_at DESC LIMIT 15'
+          'SELECT user_id, username, guild_id, channel_id, message_text, click_count, initiated_at FROM spam_logs ORDER BY initiated_at DESC LIMIT 15'
         );
 
         if (res.rowCount > 0) {
           const logsList = res.rows.map((row) => {
-            const dateStr = row.initiated_at ? new Date(row.initiated_at).toLocaleString() : 'N/A';
+            const dateStr = row.initiated_at ? new Date(row.initiated_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST' : 'N/A';
             const server = row.guild_id ? `Server ID: \`${row.guild_id}\`` : 'DM';
             const channel = row.channel_id ? `<#${row.channel_id}> (\`${row.channel_id}\`)` : 'N/A';
+            const clicks = row.click_count || 1;
             const cleanText = row.message_text.replace(/`/g, '\\`').slice(0, 100);
-            return `📅 **${dateStr}**\n👤 **User:** <@${row.user_id}> (\`${row.username || row.user_id}\`)\n🌐 **Location:** ${server} | **Channel:** ${channel}\n💬 **Message:** \`${cleanText}\`\n`;
+            return `📅 **${dateStr}** (Clicks: **${clicks}**)\n👤 **User:** <@${row.user_id}> (\`${row.username || row.user_id}\`)\n🌐 **Location:** ${server} | **Channel:** ${channel}\n💬 **Message:** \`${cleanText}\`\n`;
           }).join('\n');
 
           await interaction.reply({
@@ -493,6 +735,126 @@ client.on('interactionCreate', async (interaction) => {
         console.error('Error executing /spamlogs command:', error);
         await interaction.reply({
           content: '❌ Database error occurred while retrieving spam logs.',
+          flags: MessageFlags.Ephemeral
+        }).catch(() => {});
+      }
+    }
+
+    else if (commandName === 'stopall') {
+      try {
+        const executorId = interaction.user.id;
+
+        // Owner only check
+        if (!ownerId || executorId !== ownerId) {
+          return interaction.reply({
+            content: '❌ Only the application owner can use this command.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        let stopCount = 0;
+        userSpams.forEach((userData) => {
+          if (userData.queue.length > 0 || userData.sending) {
+            userData.queue = [];
+            stopCount++;
+          }
+        });
+
+        await interaction.reply({
+          content: `🛑 Stopped active spam sequences for **${stopCount}** users.`,
+          flags: MessageFlags.Ephemeral
+        });
+      } catch (error) {
+        console.error('Error executing /stopall command:', error);
+        await interaction.reply({
+          content: '❌ An error occurred while stopping all spams.',
+          flags: MessageFlags.Ephemeral
+        }).catch(() => {});
+      }
+    }
+
+    else if (commandName === 'unsendall') {
+      try {
+        const executorId = interaction.user.id;
+
+        // Owner only check
+        if (!ownerId || executorId !== ownerId) {
+          return interaction.reply({
+            content: '❌ Only the application owner can use this command.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+
+        // First stop all active queues
+        userSpams.forEach((userData) => {
+          userData.queue = [];
+        });
+
+        // Wait for any active sends to finish
+        let anySending = true;
+        let checks = 0;
+        while (anySending && checks < 20) {
+          anySending = false;
+          userSpams.forEach((userData) => {
+            if (userData.sending) anySending = true;
+          });
+          if (anySending) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+            checks++;
+          }
+        }
+
+        // Gather all messages to delete
+        const allMessages = [];
+        userSpams.forEach((userData) => {
+          if (userData.messages.length > 0) {
+            allMessages.push(...userData.messages);
+            userData.messages = []; // Clear local list immediately
+          }
+        });
+
+        if (allMessages.length > 0) {
+          await interaction.reply({
+            content: `🧹 Deleting **${allMessages.length}** messages sent by all users to clean traces...`,
+            flags: MessageFlags.Ephemeral
+          });
+
+          const deletePromises = allMessages.map(async (item) => {
+            try {
+              // Try webhook deletion first
+              await item.webhook.deleteMessage(item.id);
+              return true;
+            } catch (webhookError) {
+              try {
+                // Fallback to bot token API channel fetch
+                const channel = await client.channels.fetch(item.channelId);
+                const fetchedMsg = await channel.messages.fetch(item.id);
+                await fetchedMsg.delete();
+                return true;
+              } catch (deleteError) {
+                console.error(`[Unsendall Error] Failed to delete message ${item.id}:`, deleteError.message);
+                return false;
+              }
+            }
+          });
+
+          const results = await Promise.all(deletePromises);
+          const deletedCount = results.filter(Boolean).length;
+
+          await interaction.followUp({
+            content: `✨ Successfully deleted **${deletedCount}** of **${allMessages.length}** total tracked messages.`,
+            flags: MessageFlags.Ephemeral
+          });
+        } else {
+          await interaction.reply({
+            content: 'No spam messages found to delete.',
+            flags: MessageFlags.Ephemeral
+          });
+        }
+      } catch (error) {
+        console.error('Error executing /unsendall command:', error);
+        await interaction.reply({
+          content: '❌ An error occurred while unsending all messages.',
           flags: MessageFlags.Ephemeral
         }).catch(() => {});
       }
@@ -517,8 +879,44 @@ client.on('interactionCreate', async (interaction) => {
     
     else if (customId.startsWith('spam_click:')) {
       try {
-        const messageText = customId.slice('spam_click:'.length);
+        const sessionId = customId.slice('spam_click:'.length);
         const userId = interaction.user.id;
+
+        // Fetch spam options from either database or local Map
+        let session = null;
+        if (databaseUrl) {
+          try {
+            const res = await pool.query(
+              'SELECT message_text, spam_count, delay_ms, use_tts, use_embed FROM spam_sessions WHERE session_id = $1',
+              [sessionId]
+            );
+            if (res.rowCount > 0) {
+              session = res.rows[0];
+            }
+          } catch (dbErr) {
+            console.error('[Database] Failed to fetch spam session:', dbErr.message);
+          }
+        }
+
+        if (!session) {
+          session = localSpamSessions.get(sessionId);
+        }
+
+        if (!session) {
+          try {
+            await interaction.followUp({
+              content: '❌ This spam session has expired or is invalid.',
+              flags: MessageFlags.Ephemeral
+            }).catch(() => {});
+          } catch (err) {}
+          return;
+        }
+
+        const messageText = session.message_text;
+        const count = session.spam_count || 5;
+        const delay = session.delay_ms || 100;
+        const tts = session.use_tts || false;
+        const embed = session.use_embed || false;
 
         // Initialize user entry if not exists
         if (!userSpams.has(userId)) {
@@ -529,29 +927,51 @@ client.on('interactionCreate', async (interaction) => {
         // Acknowledge the interaction immediately to prevent timeout silently
         await interaction.deferUpdate();
 
-        // Log the spam initiation if database is configured
+        // Log the spam initiation if database is configured (avoiding duplicates within 3 minutes)
         if (databaseUrl) {
           try {
-            await pool.query(
-              'INSERT INTO spam_logs (user_id, username, guild_id, channel_id, message_text) VALUES ($1, $2, $3, $4, $5)',
-              [
-                userId,
-                interaction.user.tag || interaction.user.username,
-                interaction.guildId || null,
-                interaction.channelId || null,
-                messageText.slice(0, 200)
-              ]
+            // Check if there is an existing log for this user, channel, and message text in the last 3 minutes
+            const checkLog = await pool.query(
+              `SELECT id FROM spam_logs 
+               WHERE user_id = $1 AND channel_id = $2 AND message_text = $3 
+               AND initiated_at > NOW() - INTERVAL '3 minutes'
+               ORDER BY initiated_at DESC LIMIT 1`,
+              [userId, interaction.channelId || null, messageText.slice(0, 200)]
             );
+
+            if (checkLog.rowCount > 0) {
+              // Duplicate found! Increment click count instead of inserting new row
+              const logId = checkLog.rows[0].id;
+              await pool.query(
+                'UPDATE spam_logs SET click_count = click_count + 1, initiated_at = CURRENT_TIMESTAMP WHERE id = $1',
+                [logId]
+              );
+            } else {
+              // No recent duplicate. Insert fresh record.
+              await pool.query(
+                'INSERT INTO spam_logs (user_id, username, guild_id, channel_id, message_text, click_count) VALUES ($1, $2, $3, $4, $5, 1)',
+                [
+                  userId,
+                  interaction.user.tag || interaction.user.username,
+                  interaction.guildId || null,
+                  interaction.channelId || null,
+                  messageText.slice(0, 200)
+                ]
+              );
+            }
           } catch (dbErr) {
             console.error('[Database] Failed to log spam execution:', dbErr.message);
           }
         }
 
-        // Add 5 messages to the queue
-        for (let i = 0; i < 5; i++) {
+        // Add customizable messages to the queue
+        for (let i = 0; i < count; i++) {
           userData.queue.push({
             messageText,
-            interaction
+            interaction,
+            tts,
+            embed,
+            delay
           });
         }
 

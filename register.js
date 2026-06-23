@@ -30,7 +30,7 @@ const commands = [
   },
   {
     name: 'spam',
-    description: 'Replies with an ephemeral message containing a spam button',
+    description: 'Replies with an ephemeral message containing a custom spam button',
     integration_types: [1],
     contexts: [0, 1, 2],
     options: [
@@ -39,7 +39,27 @@ const commands = [
         description: 'The text the bot will spam when the button is clicked',
         type: 3, // String type
         required: true,
-        max_length: 80
+        max_length: 2000
+      },
+      {
+        name: 'delay',
+        description: 'Delay in ms between messages (100ms - 5000ms, default: 100ms)',
+        type: 4, // Integer type
+        required: false,
+        min_value: 100,
+        max_value: 5000
+      },
+      {
+        name: 'tts',
+        description: 'Enable Text-to-Speech (default: false)',
+        type: 5, // Boolean type
+        required: false
+      },
+      {
+        name: 'embed',
+        description: 'Send spammed messages as Rich Embed cards (default: false)',
+        type: 5, // Boolean type
+        required: false
       }
     ]
   },
@@ -92,6 +112,18 @@ const commands = [
   {
     name: 'spamlogs',
     description: 'Shows the recent spam command logs (Owner Only)',
+    integration_types: [1],
+    contexts: [0, 1, 2]
+  },
+  {
+    name: 'stopall',
+    description: 'Instantly stops all active spam sequences across all users (Owner Only)',
+    integration_types: [1],
+    contexts: [0, 1, 2]
+  },
+  {
+    name: 'unsendall',
+    description: 'Deletes all tracked spam messages sent by the bot for all users (Owner Only)',
     integration_types: [1],
     contexts: [0, 1, 2]
   }
