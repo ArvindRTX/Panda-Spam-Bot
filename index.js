@@ -1213,7 +1213,6 @@ async function processQueue(userId) {
           setTimeout(async () => {
             await deleteMessageTracked(messageTracker, userId);
           }, selfDestructSec * 1000);
-<<<<<<< HEAD
         }
 
       } catch (itemErr) {
@@ -1226,12 +1225,6 @@ async function processQueue(userId) {
             console.error('[Database] Failed to delete queue item after failure:', dbErr.message);
           }
         }
-=======
-        }
-
-      } catch (itemErr) {
-        console.error(`[Spam Queue Item Failure] user ${userId}:`, itemErr.message);
->>>>>>> 5c4a94430e85d74e4efb357f449a427d022367aa
       }
 
       if (userData.queue.length > 0) {
