@@ -11,10 +11,13 @@ const loginOverlay = document.getElementById('login-overlay');
 const loginForm = document.getElementById('login-form');
 const adminPassInput = document.getElementById('admin-pass');
 const loginError = document.getElementById('login-error');
+const oauthContainer = document.getElementById('oauth-container');
+const discordLoginBtn = document.getElementById('discord-login-btn');
 
 const appContainer = document.getElementById('app-container');
 const logoutBtn = document.getElementById('logout-btn');
 const connectionStatus = document.getElementById('connection-status');
+const themeSelect = document.getElementById('theme-select');
 
 // Metrics elements
 const botStatusEl = document.getElementById('bot-status');
@@ -36,13 +39,50 @@ const refreshLogsBtn = document.getElementById('refresh-logs-btn');
 const logsLoading = document.getElementById('logs-loading');
 const logsListContainer = document.getElementById('logs-list-container');
 const logSearchInput = document.getElementById('log-search-input');
+const logLocationFilter = document.getElementById('log-location-filter');
+const logDateFilter = document.getElementById('log-date-filter');
+const exportLogsBtn = document.getElementById('export-logs-btn');
 
 // Active Queues elements
 const activeQueuesList = document.getElementById('active-queues-list-container');
 const activeQueuesCount = document.getElementById('active-queues-count');
 
+// Diagnostics elements
+const diagnosticsListContainer = document.getElementById('diagnostics-list-container');
+const diagnosticsCount = document.getElementById('diagnostics-count');
+
+// Web Spammer Console elements
+const webSpamForm = document.getElementById('web-spam-form');
+const spamEmbedCheckbox = document.getElementById('spam-embed');
+const embedOptionsPanel = document.getElementById('embed-options-panel');
+const consoleFeedback = document.getElementById('console-feedback');
+
 // Initial Setup
 document.addEventListener('DOMContentLoaded', () => {
+  // Initialize Theme
+  const savedTheme = localStorage.getItem('panda_theme') || 'default';
+  document.body.setAttribute('data-theme', savedTheme);
+  themeSelect.value = savedTheme;
+  themeSelect.addEventListener('change', handleThemeChange);
+
+  // Check URL Query Parameters for OAuth Redirects
+  const urlParams = new URLSearchParams(window.location.search);
+  const tokenParam = urlParams.get('token');
+  const errorParam = urlParams.get('error');
+
+  if (tokenParam) {
+    adminPassword = tokenParam;
+    localStorage.setItem('panda_admin_pass', tokenParam);
+    // Strip query parameters
+    window.history.replaceState({}, document.title, window.location.pathname);
+  } else if (errorParam) {
+    loginError.textContent = `OAuth Error: ${decodeURIComponent(errorParam)}`;
+    window.history.replaceState({}, document.title, window.location.pathname);
+  }
+
+  // Load configuration and check OAuth Status
+  checkConfig();
+
   if (adminPassword) {
     verifyAuthentication(adminPassword);
   }
@@ -52,6 +92,24 @@ document.addEventListener('DOMContentLoaded', () => {
   addUserForm.addEventListener('submit', handleAuthorizeUser);
   refreshLogsBtn.addEventListener('click', () => loadLogs(true));
   logSearchInput.addEventListener('input', filterAndRenderLogs);
+  logLocationFilter.addEventListener('change', filterAndRenderLogs);
+  logDateFilter.addEventListener('change', filterAndRenderLogs);
+  exportLogsBtn.addEventListener('click', exportLogsToCSV);
+
+  // Collapsible Embed Options in Web Console
+  spamEmbedCheckbox.addEventListener('change', () => {
+    if (spamEmbedCheckbox.checked) {
+      embedOptionsPanel.classList.remove('hidden');
+    } else {
+      embedOptionsPanel.classList.add('hidden');
+    }
+  });
+
+  // Web Spammer Console form submission
+  webSpamForm.addEventListener('submit', handleWebSpamSubmit);
+
+  // Tabs navigation wiring
+  setupTabs();
 });
 
 // Helper for HTTP requests
@@ -202,6 +260,16 @@ function initDashboard() {
     }
   });
 
+  // Handle diagnostics updates
+  sseSource.addEventListener('diagnostics', (event) => {
+    try {
+      const errors = JSON.parse(event.data);
+      renderDiagnostics(errors);
+    } catch (err) {
+      console.error('[SSE] Failed to parse diagnostics event:', err);
+    }
+  });
+
   sseSource.onerror = (err) => {
     console.error('[SSE] EventSource connection error:', err);
     setConnectionStatus(false, 'Reconnecting...');
@@ -315,10 +383,8 @@ async function loadLogs(manual = false) {
 // Search logs and render filtered results
 function filterAndRenderLogs() {
   const query = logSearchInput.value.trim().toLowerCase();
-  if (!query) {
-    renderLogs(allLogs);
-    return;
-  }
+  const location = logLocationFilter.value;
+  const dateVal = logDateFilter.value;
 
   const filtered = allLogs.filter(log => {
     const username = (log.username || '').toLowerCase();
@@ -326,15 +392,32 @@ function filterAndRenderLogs() {
     const guildId = (log.guild_id || 'dm').toLowerCase();
     const channelId = (log.channel_id || 'dm').toLowerCase();
     const text = (log.message_text || '').toLowerCase();
+    
+    const textMatch = !query || 
+                      username.includes(query) ||
+                      userId.includes(query) ||
+                      guildId.includes(query) ||
+                      channelId.includes(query) ||
+                      text.includes(query);
 
-    return username.includes(query) ||
-           userId.includes(query) ||
-           guildId.includes(query) ||
-           channelId.includes(query) ||
-           text.includes(query);
+    let locMatch = true;
+    if (location === 'guild') {
+      locMatch = !!log.guild_id;
+    } else if (location === 'dm') {
+      locMatch = !log.guild_id;
+    }
+
+    let dateMatch = true;
+    if (dateVal) {
+      const logDateStr = new Date(log.initiated_at).toISOString().split('T')[0];
+      dateMatch = logDateStr === dateVal;
+    }
+
+    return textMatch && locMatch && dateMatch;
   });
 
   renderLogs(filtered);
+  window.filteredLogsCache = filtered;
 }
 
 // Render dynamic log rows
@@ -750,4 +833,204 @@ function escapeHTML(str) {
       '"': '&quot;'
     }[tag] || tag)
   );
+}
+
+// Render Error Diagnostics
+function renderDiagnostics(errors) {
+  diagnosticsCount.textContent = `${errors.length} Errors`;
+  diagnosticsListContainer.innerHTML = '';
+
+  if (errors.length === 0) {
+    diagnosticsListContainer.innerHTML = '<div class="empty-placeholder">No errors logged. All systems nominal! 🐼</div>';
+    return;
+  }
+
+  errors.forEach(err => {
+    const row = document.createElement('div');
+    row.className = 'error-log-row';
+
+    const header = document.createElement('div');
+    header.className = 'error-log-header';
+    
+    const codeSpan = document.createElement('span');
+    codeSpan.style.fontWeight = 'bold';
+    codeSpan.style.color = 'var(--accent-red)';
+    codeSpan.textContent = err.error_code ? `Error Code: ${err.error_code}` : 'API Error';
+    
+    const timeSpan = document.createElement('span');
+    timeSpan.style.fontSize = '0.75rem';
+    timeSpan.style.color = 'var(--text-muted)';
+    timeSpan.textContent = new Date(err.timestamp || err.initiated_at).toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST';
+    
+    header.appendChild(codeSpan);
+    header.appendChild(timeSpan);
+
+    const msg = document.createElement('div');
+    msg.className = 'error-log-msg';
+    msg.textContent = err.error_message;
+
+    const meta = document.createElement('div');
+    meta.className = 'error-log-meta';
+    
+    const locText = [];
+    if (err.user_id) locText.push(`User: ${err.user_id}`);
+    if (err.channel_id) locText.push(`Channel: ${err.channel_id}`);
+    if (err.guild_id) locText.push(`Guild: ${err.guild_id}`);
+    meta.textContent = locText.join(' | ') || 'System Event';
+
+    row.appendChild(header);
+    row.appendChild(msg);
+    row.appendChild(meta);
+    diagnosticsListContainer.appendChild(row);
+  });
+}
+
+// Theme Switcher handler
+function handleThemeChange(e) {
+  const theme = e.target.value;
+  document.body.setAttribute('data-theme', theme);
+  localStorage.setItem('panda_theme', theme);
+}
+
+// Web Spammer Console execution trigger
+async function handleWebSpamSubmit(e) {
+  e.preventDefault();
+  
+  const channelId = document.getElementById('spam-channel-id').value.trim();
+  const delay = parseInt(document.getElementById('spam-delay').value, 10) || 100;
+  const messageText = document.getElementById('spam-text').value;
+  
+  const embed = document.getElementById('spam-embed').checked;
+  const tts = document.getElementById('spam-tts').checked;
+  const ghostSpam = document.getElementById('spam-ghost').checked;
+  const pandaRaid = document.getElementById('spam-panda-raid').checked;
+  
+  const embedTitle = document.getElementById('spam-embed-title').value.trim();
+  const embedColor = document.getElementById('spam-embed-color').value;
+  const embedImageUrl = document.getElementById('spam-embed-image').value.trim();
+  
+  const selfDestruct = parseInt(document.getElementById('spam-self-destruct').value, 10) || 0;
+
+  showConsoleFeedback('Initiating spam command...', true);
+
+  try {
+    const data = await fetchAPI('/api/spam/trigger', {
+      method: 'POST',
+      body: JSON.stringify({
+        channelId,
+        messageText,
+        delay,
+        tts,
+        embed,
+        selfDestruct,
+        ghostSpam,
+        pandaRaid,
+        embedTitle,
+        embedImageUrl,
+        embedColor
+      })
+    });
+    
+    showConsoleFeedback(data.message, true);
+    document.getElementById('spam-text').value = '';
+  } catch (err) {
+    showConsoleFeedback(err.message, false);
+  }
+}
+
+function showConsoleFeedback(text, success) {
+  consoleFeedback.className = 'action-feedback ' + (success ? 'feedback-success' : 'feedback-error');
+  consoleFeedback.textContent = text;
+  setTimeout(() => {
+    consoleFeedback.textContent = '';
+  }, 4000);
+}
+
+// Setup operations vs settings tabs switching
+function setupTabs() {
+  const tabButtons = document.querySelectorAll('.tab-btn');
+  const tabPanels = document.querySelectorAll('.tab-panel');
+
+  tabButtons.forEach(btn => {
+    btn.addEventListener('click', () => {
+      tabButtons.forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+
+      const targetTab = btn.getAttribute('data-tab');
+      tabPanels.forEach(p => {
+        if (p.id === targetTab) {
+          p.classList.remove('hidden');
+        } else {
+          p.classList.add('hidden');
+        }
+      });
+    });
+  });
+}
+
+// Convert logs to CSV format and prompt download
+function exportLogsToCSV() {
+  const logsToExport = window.filteredLogsCache || allLogs;
+  if (!logsToExport || logsToExport.length === 0) {
+    alert('No audit logs available to export.');
+    return;
+  }
+
+  const headers = ['Timestamp (IST)', 'User Tag', 'User ID', 'Location', 'Guild/Channel IDs', 'Clicks Count', 'Message Text'];
+  
+  const rows = logsToExport.map(log => {
+    const timeStr = new Date(log.initiated_at).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) + ' IST';
+    const loc = log.guild_name ? 'Guild Server' : (log.guild_id ? 'Guild Server' : 'DM');
+    const ids = log.guild_id ? `Server: ${log.guild_id} | Channel: ${log.channel_id}` : `DM Channel: ${log.channel_id || 'N/A'}`;
+    const cleanText = (log.message_text || '').replace(/"/g, '""');
+
+    return [
+      `"${timeStr}"`,
+      `"${log.username || 'Unknown'}"`,
+      `"${log.user_id}"`,
+      `"${loc}"`,
+      `"${ids}"`,
+      log.click_count || 1,
+      `"${cleanText}"`
+    ];
+  });
+
+  const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  
+  const link = document.createElement('a');
+  const url = URL.createObjectURL(blob);
+  link.setAttribute('href', url);
+  link.setAttribute('download', `panda_spam_logs_${new Date().toISOString().split('T')[0]}.csv`);
+  link.style.visibility = 'hidden';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+// Fetch bot configurations (like OAuth parameters state)
+async function checkConfig() {
+  try {
+    const res = await fetch(`${window.location.origin}/api/config`);
+    const data = await res.json();
+    if (data.oauthEnabled) {
+      oauthContainer.classList.remove('hidden');
+      
+      discordLoginBtn.addEventListener('click', async () => {
+        try {
+          const authUrlRes = await fetch(`${window.location.origin}/api/auth/url`);
+          const authUrlData = await authUrlRes.json();
+          if (authUrlData.url) {
+            window.location.href = authUrlData.url;
+          } else {
+            console.error('Failed to get authorize URL:', authUrlData.error);
+          }
+        } catch (err) {
+          console.error('Error fetching authorize URL:', err);
+        }
+      });
+    }
+  } catch (err) {
+    console.warn('[Config] Failed to fetch server config state:', err.message);
+  }
 }

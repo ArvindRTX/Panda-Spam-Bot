@@ -68,6 +68,18 @@ const commands = [
         required: false,
         min_value: 1,
         max_value: 3600
+      },
+      {
+        name: 'ghost_spam',
+        description: 'Sends and deletes messages instantly (500ms) (default: false)',
+        type: 5, // Boolean type
+        required: false
+      },
+      {
+        name: 'panda_raid',
+        description: 'Sends animated pandas instead of your message text (default: false)',
+        type: 5, // Boolean type
+        required: false
       }
     ]
   },
