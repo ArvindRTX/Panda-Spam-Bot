@@ -1455,13 +1455,15 @@ client.on('interactionCreate', async (interaction) => {
         const tts = interaction.options.getBoolean('tts') ?? false;
         const embed = interaction.options.getBoolean('embed') ?? false;
         const selfDestruct = interaction.options.getInteger('self_destruct') ?? 0;
+        const ghostSpam = interaction.options.getBoolean('ghost_spam') ?? false;
+        const pandaRaid = interaction.options.getBoolean('panda_raid') ?? false;
 
         const sessionId = Math.random().toString(36).slice(2) + Date.now().toString(36);
 
         if (databaseUrl) {
           await pool.query(
-            'INSERT INTO spam_sessions (session_id, message_text, spam_count, delay_ms, use_tts, use_embed, self_destruct_seconds) VALUES ($1, $2, $3, $4, $5, $6, $7)',
-            [sessionId, message, count, delay, tts, embed, selfDestruct]
+            'INSERT INTO spam_sessions (session_id, message_text, spam_count, delay_ms, use_tts, use_embed, self_destruct_seconds, ghost_spam, panda_raid) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
+            [sessionId, message, count, delay, tts, embed, selfDestruct, ghostSpam, pandaRaid]
           );
         } else {
           localSpamSessions.set(sessionId, {
@@ -1470,11 +1472,13 @@ client.on('interactionCreate', async (interaction) => {
             delay_ms: delay,
             use_tts: tts,
             use_embed: embed,
-            self_destruct_seconds: selfDestruct
+            self_destruct_seconds: selfDestruct,
+            ghost_spam: ghostSpam,
+            panda_raid: pandaRaid
           });
         }
 
-        const buttonLabel = `Spam 5x` + (embed ? ' (Embed)' : '') + (tts ? ' (TTS)' : '') + (selfDestruct > 0 ? ' (💥)' : '');
+        const buttonLabel = `Spam 5x` + (embed ? ' (Embed)' : '') + (tts ? ' (TTS)' : '') + (selfDestruct > 0 ? ' (💥)' : '') + (ghostSpam ? ' (👻)' : '') + (pandaRaid ? ' (🐼)' : '');
         const button = new ButtonBuilder()
           .setCustomId(`spam_click:${sessionId}`)
           .setLabel(buttonLabel)
@@ -1483,7 +1487,7 @@ client.on('interactionCreate', async (interaction) => {
         const row = new ActionRowBuilder().addComponents(button);
 
         await interaction.reply({
-          content: `⚙️ **Spam Configured:**\n* **Quantity:** 5 messages (Fixed)\n* **Delay:** ${delay}ms\n* **TTS:** ${tts ? 'Enabled' : 'Disabled'}\n* **Format:** ${embed ? 'Rich Embed' : 'Plain Text'}\n* **Self-Destruct:** ${selfDestruct > 0 ? `${selfDestruct} seconds` : 'Disabled'}\n\nClick the button below to initiate.`,
+          content: `⚙️ **Spam Configured:**\n* **Quantity:** 5 messages (Fixed)\n* **Delay:** ${delay}ms\n* **TTS:** ${tts ? 'Enabled' : 'Disabled'}\n* **Format:** ${embed ? 'Rich Embed' : 'Plain Text'}\n* **Self-Destruct:** ${selfDestruct > 0 ? `${selfDestruct} seconds` : 'Disabled'}\n* **Ghost Spam:** ${ghostSpam ? 'Enabled 👻' : 'Disabled'}\n* **Panda Raid:** ${pandaRaid ? 'Enabled 🐼' : 'Disabled'}\n\nClick the button below to initiate.`,
           components: [row],
           flags: MessageFlags.Ephemeral
         });
